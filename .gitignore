@@ -1,0 +1,15 @@
+# Machine-specific config (secrets, absolute paths) — every skill keeps its real
+# values here; only config.example.json is committed.
+**/config.json
+
+# Optional machine-specific deploy targets (deploy.py)
+deploy.json
+
+# Python
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store

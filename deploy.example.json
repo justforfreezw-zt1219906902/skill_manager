@@ -1,0 +1,4 @@
+{
+  "libraries": ["/Users/<username>/source/skill-library"],
+  "targets": ["/Users/<username>/.claude/skills", "/Users/<username>/.codex/skills"]
+}
