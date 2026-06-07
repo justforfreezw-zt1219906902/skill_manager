@@ -47,7 +47,9 @@ A skill produces two kinds of files, and they deserve different treatment. *Outp
 
 Two of the steps are about the *process* rather than the finished skill, and they're the ones easiest to skip.
 
-**Verify before reporting.** A migration that looks finished but quietly broke a path is worse than no migration, because nothing tells you until you're depending on it. So the librarian refuses to trust itself: it greps the result for leftover coupling, actually runs the vendored scripts from their new home, and confirms the secret is git-ignored before it claims the skill works.
+**Verify before reporting.** A migration that looks finished but quietly broke a path is worse than no migration, because nothing tells you until you're depending on it. So the librarian refuses to trust itself: it greps the result for leftover coupling, actually runs the vendored scripts from their new home, and confirms the secret is git-ignored.
+
+**Then prove it with a fresh run.** Static checks confirm the parts; they can't confirm the whole. So the real proof is handing the finished skill to a *fresh subagent given nothing but the skill itself* and having it do a real task end to end. If a path still pointed home, a step leaned on something only this machine had, or a dependency only resolved because it happened to be installed, the fresh run is where it surfaces — and the fixes go in while they're concrete.
 
 **Offer cleanup, never force it.** Once the new copy is verified and reported, there's tidying to do, but it's offered rather than assumed. The librarian clears the scratch a test run leaves behind, then lays out what to do with the original skill: leave it, symlink it to the library, or delete it, along with any now-orphaned scripts. For each one it tells you how or offers to do it for you, and nothing you already had gets removed without your say-so.
 
@@ -66,7 +68,7 @@ Two of the steps are about the *process* rather than the finished skill, and the
 
 ## Using it
 
-Point the agent at a skill folder: *"skill-librarian: bring `~/path/to/some-skill` into the library"* (or "add this skill to the skill library"). It runs one skill at a time through six phases — locate & guard, audit, migrate, **verify**, report, then **offer cleanup** — and stops to ask if the skill already exists in the library.
+Point the agent at a skill folder: *"skill-librarian: bring `~/path/to/some-skill` into the library"* (or "add this skill to the skill library"). It runs one skill at a time through seven phases — locate & guard, audit, migrate, **verify**, **prove it end-to-end** (a fresh subagent runs the whole skill on a real input), report, then **offer cleanup** — and stops to ask if the skill already exists in the library.
 
 ## Notes
 

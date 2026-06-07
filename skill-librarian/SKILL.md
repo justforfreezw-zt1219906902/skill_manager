@@ -1,6 +1,6 @@
 ---
 name: skill-librarian
-description: Use when the user wants to make an agent skill self-contained and portable, or file a skill into a central skill library so it works on any machine and across agent runtimes (Claude Code, Codex, Hermes, OpenClaw, …). Migrates a skill out of wherever its runtime keeps skills (e.g. ~/.claude/skills or a project's .claude/skills) into the skill-library repo, vendoring in the scripts it depends on, extracting secrets and hardcoded paths into config.json, relocating state files, and then VERIFYING the result by actually running it. Triggers on "skill-librarian", "add to skill library", "make this skill portable", "self-contain this skill", "vendor this skill", "package this skill", "migrate this skill". Reach for this whenever a skill needs to move and keep working — a plain copy silently breaks scripts, leaks secrets into git, or drags in a .venv.
+description: Use when the user wants to make an agent skill self-contained and portable, or file a skill into a central skill library so it works on any machine and across agent runtimes (Claude Code, Codex, Hermes, OpenClaw, …). Migrates a skill out of wherever its runtime keeps skills (e.g. ~/.claude/skills or a project's .claude/skills) into the skill-library repo, vendoring in the scripts it depends on, extracting secrets and hardcoded paths into config.json, relocating state files, then VERIFYING it — static checks plus a full end-to-end run by a fresh agent given only the skill. Triggers on "skill-librarian", "add to skill library", "make this skill portable", "self-contain this skill", "vendor this skill", "package this skill", "migrate this skill". Reach for this whenever a skill needs to move and keep working — a plain copy silently breaks scripts, leaks secrets into git, or drags in a .venv.
 ---
 
 # Skill Librarian
@@ -38,15 +38,16 @@ Two token styles appear below and mean different things: **`$NAME`** is a live s
 
 ## The workflow
 
-Work one skill at a time. Create a TodoWrite list with the six phases below so nothing gets skipped — the verify and clean-up phases are the ones that are easy to drop and the most expensive to skip.
+Work one skill at a time. Create a TodoWrite list with the seven phases below so nothing gets skipped — the two verify phases (static checks, then the end-to-end run) and the clean-up phase are the easiest to drop and the most expensive to skip.
 
 ```
-Phase 0  Locate & guard      → find the skill; bail if it already exists in the library
-Phase 1  Audit dependencies  → classify everything the skill touches
-Phase 2  Migrate             → copy the body, vendor scripts, extract config, relocate state
-Phase 3  Verify              → grep-clean, RUN it, confirm secrets are git-ignored
-Phase 4  Report              → tell the user what moved, what config they must fill in
-Phase 5  Deploy & clean up   → link the new skill into the runtimes, then tidy up with the user
+Phase 0  Locate & guard       → find the skill; bail if it already exists in the library
+Phase 1  Audit dependencies   → classify everything the skill touches
+Phase 2  Migrate              → copy the body, vendor scripts, extract config, relocate state
+Phase 3  Verify               → grep-clean, RUN the scripts, confirm secrets are git-ignored
+Phase 4  Prove it end-to-end  → run the whole skill via a minimal-context subagent; fix what it flags
+Phase 5  Report               → tell the user what moved, what config they must fill in
+Phase 6  Deploy & clean up    → link the new skill into the runtimes, then tidy up with the user
 ```
 
 ### Phase 0 — Locate & guard
@@ -157,17 +158,29 @@ A migration that *looks* moved but silently broke a path is worse than no migrat
 
 If any check fails, fix it before moving on. Don't report success on an unverified migration.
 
-### Phase 4 — Report
+### Phase 4 — Prove it end-to-end (minimal-context subagent)
+
+Phase 3 confirms the parts; this confirms the whole — that a *fresh agent handed only the skill* can actually do the job on a real input. It catches what the static checks can't: a vendored doc still pointing at the old path, a step that silently relied on ambient context, a config key the body forgot to read, a dependency that only resolved because something happened to be installed globally. If the migration has a hole, this is where it shows — and it's the easiest phase to skip, so don't.
+
+1. **Minimal context is the point.** Dispatch a subagent (the runtime's task/subagent tool) and give it almost nothing: the absolute path to the migrated `SKILL.md`, the value of `$SKILL_DIR` (so its `config.json` reads resolve), one realistic task/input, and the instruction to *follow that `SKILL.md` by path* — and explicitly NOT to use any installed skill of the same name (the original is often still loaded). Don't feed it the conventions, the audit, or hints. If it needs something you didn't put in the skill, that's a finding.
+2. **Real but bounded input.** Representative and small (a few items, not hundreds) so the run is fast and the output is easy to check.
+3. **Gate outward side-effects.** If the skill's happy path publishes, emails, pushes, or otherwise acts off the machine, confirm scope with the user first (full end-to-end vs. stop before the outward step). A local-output-only skill can run freely.
+4. **Have it report friction precisely.** The subagent is a fresh pair of eyes — ask it to quote anything in the `SKILL.md` that was unclear, broken, missing, or worked-around. Apply those fixes now, while concrete; some turn out to be improvements to the *original* skill, not just the migration.
+5. **A subagent usually can't spawn its own subagents.** If the skill's workflow fans out to subagents, the tester will run that step inline instead — a runtime limit, not a skill defect. Note it, and consider giving the skill a sequential fallback.
+
+If a full run genuinely can't happen here (interactive auth, a device, live credentials it shouldn't use), say so in the report and fall back to the Phase 3 component run — don't silently skip this.
+
+### Phase 5 — Report
 
 Tell the user, concisely:
 - **Moved/vendored:** which scripts came across, which were dropped (`.venv`, etc.)
 - **Config keys created:** and which you auto-filled vs. which they must fill in
 - **State relocated:** old path → `<state_root>/<name>/`
 - **Prerequisite skills/MCPs:** anything referenced but not copied
-- **Verification:** what ran clean, what was only smoke-tested
+- **Verification:** static checks (Phase 3) + the end-to-end run (Phase 4) — what passed, what the test subagent flagged and you fixed, what was only smoke-tested
 - **Not committed** unless they asked — leave staging to them
 
-### Phase 5 — Deploy, then clean up
+### Phase 6 — Deploy, then clean up
 
 The migration is verified and reported. Now **deploy the skill** so it actually loads, then tidy up. Deploying is something you do (safely — see below); the cleanup items are offered, and nothing that touches files the user already had goes ahead without a yes.
 

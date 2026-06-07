@@ -33,7 +33,7 @@ When the user asks you to **get started** or help them set this up, walk them th
 ## Where the detail lives
 
 - `README.md` — the conventions: what "self-contained" means, the config/state rules, and how `deploy.py` works.
-- `skill-librarian/SKILL.md` — how a migration runs (its six phases), with `references/` holding a worked example and copy-paste recipes.
+- `skill-librarian/SKILL.md` — how a migration runs (its seven phases, including a full end-to-end run by a fresh subagent), with `references/` holding a worked example and copy-paste recipes.
 
 ## Ground rules
 
