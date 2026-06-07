@@ -38,11 +38,12 @@ Two token styles appear below and mean different things: **`$NAME`** is a live s
 
 ## The workflow
 
-Work one skill at a time. Create a TodoWrite list with the seven phases below so nothing gets skipped — the two verify phases (static checks, then the end-to-end run) and the clean-up phase are the easiest to drop and the most expensive to skip.
+Work one skill at a time. Create a TodoWrite list with the seven phases below so nothing gets skipped. The easiest steps to drop — and the most expensive to skip — are the **gate** after the audit (don't change files before the human signs off), the two verify phases (static checks, then the end-to-end run), and the clean-up phase.
 
 ```
 Phase 0  Locate & guard       → find the skill; bail if it already exists in the library
 Phase 1  Audit dependencies   → classify everything the skill touches
+─ GATE   Sign off with human  → report findings + plan; get the OK before changing any files
 Phase 2  Migrate              → copy the body, vendor scripts, extract config, relocate state
 Phase 3  Verify               → grep-clean, RUN the scripts, confirm secrets are git-ignored
 Phase 4  Prove it end-to-end  → run the whole skill via a minimal-context subagent; fix what it flags
@@ -75,9 +76,20 @@ Two judgment calls come up a lot:
 - **State vs. output:** "if this file vanished, would the skill lose memory of what it's done?" Yes → state → relocate. Just a deliverable the user reads → output → leave the content, but make its destination a config key.
 - **Secret vs. credential:** did the *user* hand you this secret (→ `config.json`), or did the *tool* obtain it through a login/OAuth flow and write it to disk (→ `state_root/<name>/`)? The Snipd-style `login` token is the latter.
 
+### Gate — sign off with the human (before touching files)
+
+The audit produces a picture; **don't start changing files until the human has seen it.** This is the cheapest moment to catch a wrong call. Report back concisely, then wait for a go:
+
+- **What you found** — the dependency classification (what gets vendored, what's referenced as a sibling skill, what becomes a `config.json` key, what's state vs. output), and especially the **non-obvious judgment calls**: a shared, read-only datastore → config, not a vendored copy; personal data (a bio, an audience profile) → config, kept out of the committed skill; a whole workspace's shared docs → vendored into `references/<source>/`.
+- **The plan** — the config keys you'll create, the scripts you'll vendor and whether they need `uv`, where state/output will land, what you'll rewrite in the body.
+- **Name** — now that you understand what the skill actually does, assess its name. **Always show the current name and always make a recommendation** — even when you'd keep it. If the workflow points to something clearer or more accurate, propose it (e.g. `newsletter-setup` → `newsletter-profile-setup`, since it builds a profile, not sending infrastructure); if the current name is already the best fit, recommend keeping it and say why. The user picks; the chosen name becomes the library folder and the deployed skill name — re-check it doesn't collide in the library if you changed it.
+- **Open questions** — only the genuinely ambiguous ones that would change the plan. Don't ask about what you can sensibly default; do ask when the right call depends on how the user works.
+
+Then stop and let them confirm, adjust, or redirect — their answer can change what Phase 2 builds, which is the whole point of asking now instead of after. If the user has already told you to just proceed, state your plan in one pass and continue without waiting.
+
 ### Phase 2 — Migrate
 
-Build `<skill_library_path>/<name>/`.
+With the plan signed off at the gate above, build `<skill_library_path>/<name>/`.
 
 **a. Copy the body.** Copy `SKILL.md` verbatim first; you'll edit the copy, never the original. The original keeps running until the user decides to switch over.
 

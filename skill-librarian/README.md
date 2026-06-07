@@ -68,7 +68,7 @@ Two of the steps are about the *process* rather than the finished skill, and the
 
 ## Using it
 
-Point the agent at a skill folder: *"skill-librarian: bring `~/path/to/some-skill` into the library"* (or "add this skill to the skill library"). It runs one skill at a time through seven phases — locate & guard, audit, migrate, **verify**, **prove it end-to-end** (a fresh subagent runs the whole skill on a real input), report, then **offer cleanup** — and stops to ask if the skill already exists in the library.
+Point the agent at a skill folder: *"skill-librarian: bring `~/path/to/some-skill` into the library"* (or "add this skill to the skill library"). It runs one skill at a time through seven phases — locate & guard, audit, migrate, **verify**, **prove it end-to-end** (a fresh subagent runs the whole skill on a real input), report, then **offer cleanup** — with a **human sign-off gate after the audit** (you see the findings and the plan before anything changes), and it stops if the skill already exists in the library.
 
 ## Notes
 
