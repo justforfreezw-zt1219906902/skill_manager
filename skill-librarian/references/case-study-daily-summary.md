@@ -35,9 +35,18 @@ It also wrote its report to `~/Downloads/<date> Daily Summary.md` — but that's
 
 ## The migration (Phase 2)
 
-**Vendored the script** into `<skill>/scripts/get_toggl_time.py` and added a
-`scripts/requirements.txt` with just `requests`. The original used
-`python-dotenv` to read the repo `.env`; that dependency was dropped.
+**Vendored the script** into `<skill>/scripts/get_toggl_time.py` and declared its
+one dependency (`requests`) inline with a PEP 723 header, so `uv run` resolves it
+in isolation — nothing installs into global Python, and there's no
+`requirements.txt`/`.venv` to carry:
+```python
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["requests"]
+# ///
+```
+The original used `python-dotenv` to read the repo `.env`; that dependency was
+dropped.
 
 **Rewrote the script to self-locate and read config:**
 ```python
@@ -64,18 +73,18 @@ the same way. Every `/Users/...`, `.env`, and `load_dotenv` reference was gone.
 
 **Generated the support files:** `config.example.json`, `config.json`,
 `.gitignore` (containing `config.json`), and a `README.md` with the one-time
-setup (copy config, fill keys, `pip install -r scripts/requirements.txt`, and a
-note that the Todoist MCP must be connected).
+setup (copy config, fill keys, install `uv`, and a note that the Todoist MCP must
+be connected).
 
 ## The verification (Phase 3)
 
 1. **Grep clean** — searched the migrated body + script for `/Users/`, `.env`,
    `load_dotenv`, `os.getenv('TOGGL...`; the only path-like references left were
    `$SKILL_DIR`, `config.json`, and the portable `~/Downloads` output.
-2. **Ran it** — executed `get_toggl_time.py <yesterday>` from the new location; it
-   read the token from `config.json`, hit the Toggl API, and returned real
-   entries. (A `RequestsDependencyWarning` on stderr is harmless — the JSON on
-   stdout is what matters.)
+2. **Ran it** — executed `uv run get_toggl_time.py <yesterday>` from the new
+   location; `uv` installed `requests` from the inline header into its isolated
+   cache, the script read the token from `config.json`, hit the Toggl API, and
+   returned real entries on stdout.
 3. **Secret-safety** — `git check-ignore config.json` printed the path (ignored),
    and `git status` showed `config.example.json` staged but `config.json` absent.
 
@@ -85,8 +94,7 @@ note that the Todoist MCP must be connected).
 daily-summary/
 ├── SKILL.md              # reads config.json via $SKILL_DIR; no machine paths
 ├── scripts/
-│   ├── get_toggl_time.py # self-locating, reads config.json
-│   └── requirements.txt  # requests
+│   └── get_toggl_time.py # self-locating; reads config.json; PEP 723 deps (requests)
 ├── config.example.json   # committed
 ├── config.json           # git-ignored (real token + vault path)
 ├── .gitignore            # config.json
@@ -94,4 +102,4 @@ daily-summary/
 ```
 
 Anyone can clone this, copy `config.example.json` to `config.json`, drop in their
-own Toggl token and vault path, `pip install`, and run it — on any machine.
+own Toggl token and vault path, and run it with `uv` — on any machine.
