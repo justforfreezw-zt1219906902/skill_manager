@@ -76,12 +76,30 @@ Two judgment calls come up a lot:
 - **State vs. output:** "if this file vanished, would the skill lose memory of what it's done?" Yes → state → relocate. Just a deliverable the user reads → output → leave the content, but make its destination a config key.
 - **Secret vs. credential:** did the *user* hand you this secret (→ `config.json`), or did the *tool* obtain it through a login/OAuth flow and write it to disk (→ `state_root/<name>/`)? The Snipd-style `login` token is the latter.
 
+#### Phase 1b — Determinism audit (classify the workflow, not just the dependencies)
+
+While you're reading the body anyway, classify **each step of the skill's workflow**:
+
+| Class | Test | Examples |
+|---|---|---|
+| **Mechanical** | A script could do it byte-for-byte: fixed paths, fixed commands, selection by rule, file reads/writes, sending, logging | "run `date`", "pick the newest unprocessed item vs a log", "email the file", "append a TSV row" |
+| **Judgment** | The step's value IS the model's judgment: writing in a voice, summarizing, deciding, adapting to messy input | "write the newsletter", "draft posts in David's voice", "triage the incident" |
+
+Then report the ratio and, when it's lopsided, propose **compiling** the mechanical steps into `scripts/` during migration: a runner does the plumbing, and each judgment step becomes ONE `claude -p` call with **all tools disabled** and its input on stdin. The full pattern, its payoff, and two worked examples live in `references/determinism-audit.md` — read it before proposing a compile.
+
+When to push, when to leave alone:
+
+- **Push hard for skills that run unattended** (a scheduled job invokes them headlessly). Every mechanical step an agent executes is a place it can stall on a prompt no one will answer — two real jobs burned 2h/night this way — and a toolless call is structurally immune. For these, the audit's compile proposal is the default, not an option.
+- **Leave interactive, exploratory skills as prose.** If the workflow's value is adapting to what it finds (debugging, research, conversation), compiling removes the point. A 90%-judgment skill gets a "leave as prose" verdict — that is a finding, not a failure.
+- **Never compile the voice.** Prose briefs stay in `SKILL.md` and the runner extracts them at runtime; duplicating prose into code is how the two drift.
+
 ### Gate — sign off with the human (before touching files)
 
 The audit produces a picture; **don't start changing files until the human has seen it.** This is the cheapest moment to catch a wrong call. Report back concisely, then wait for a go:
 
 - **What you found** — the dependency classification (what gets vendored, what's referenced as a sibling skill, what becomes a `config.json` key, what's state vs. output), and especially the **non-obvious judgment calls**: a shared, read-only datastore → config, not a vendored copy; personal data (a bio, an audience profile) → config, kept out of the committed skill; a whole workspace's shared docs → vendored into `references/<source>/`.
 - **The plan** — the config keys you'll create, the scripts you'll vendor and whether they need `uv`, where state/output will land, what you'll rewrite in the body.
+- **Determinism verdict** (Phase 1b) — the mechanical/judgment ratio and your call: compile the mechanical steps into `scripts/` (say which, and what the one-or-few toolless LLM calls will be), or leave as prose (say why). For a skill that runs unattended, compiling is the default recommendation.
 - **Name** — now that you understand what the skill actually does, assess its name. **Always show the current name and always make a recommendation** — even when you'd keep it. If the workflow points to something clearer or more accurate, propose it (e.g. `newsletter-setup` → `newsletter-profile-setup`, since it builds a profile, not sending infrastructure); if the current name is already the best fit, recommend keeping it and say why. The user picks; the chosen name becomes the library folder and the deployed skill name — re-check it doesn't collide in the library if you changed it.
 - **Open questions** — only the genuinely ambiguous ones that would change the plan. Don't ask about what you can sensibly default; do ask when the right call depends on how the user works.
 
@@ -226,7 +244,7 @@ The migration is verified and reported. Now **deploy the skill** so it actually 
 
 ## Golden reference
 
-`references/case-study-daily-summary.md` walks through one full migration end to end — a skill with a vendored script, an extracted secret, and an extracted path — showing how the phases play out and what the finished folder looks like. Read it when you want a worked example to match. `references/migration-recipes.md` has the atomic before/after snippets for the common cases (dotenv→config, hardcoded path→config, state relocation, vendoring a Python CLI).
+`references/case-study-daily-summary.md` walks through one full migration end to end — a skill with a vendored script, an extracted secret, and an extracted path — showing how the phases play out and what the finished folder looks like. Read it when you want a worked example to match. `references/migration-recipes.md` has the atomic before/after snippets for the common cases (dotenv→config, hardcoded path→config, state relocation, vendoring a Python CLI). `references/determinism-audit.md` is the Phase 1b companion: the compile pattern (mechanical steps → `scripts/`, judgment steps → toolless `claude -p` calls), the failure modes it eliminates, and two worked examples.
 
 ## Dogfooding
 
