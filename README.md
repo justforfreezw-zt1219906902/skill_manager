@@ -28,11 +28,12 @@ Copy the machine-specific example:
 cp deploy.example.json deploy.json
 ```
 
-For Codex-oriented usage, a typical file is:
+For Codex-oriented usage with a grouped personal library, a typical file is:
 
 ```json
 {
-  "libraries": ["/Users/you/source/personal-agent-skills/skills"],
+  "libraries": ["/Users/you/source/personal-agent-skills"],
+  "ignored_directories": ["retire_skills"],
   "user_target": "/Users/you/.agents/skills",
   "targets": ["/Users/you/.agents/skills"]
 }
@@ -40,7 +41,18 @@ For Codex-oriented usage, a typical file is:
 
 `deploy.json` is git-ignored. Use absolute paths.
 
-`libraries` points at directories whose immediate children are skill folders containing `SKILL.md`.
+`libraries` points at source-library roots. Discovery is recursive, so both of these layouts work:
+
+```text
+personal-agent-skills/
+├── flat-skill/
+│   └── SKILL.md
+└── 3d_reconstruction_skills/
+    └── reconstruction-geometry/
+        └── SKILL.md
+```
+
+A directory containing `SKILL.md` is treated as a skill boundary and is not searched below. Hidden directories are skipped. `retire_skills` is ignored by default; use `ignored_directories` to add or replace ignored grouping-directory names.
 
 ## Scoped skill management
 
@@ -57,21 +69,23 @@ python3 skill-librarian/scripts/skill_librarian.py doctor
 From any directory inside a Git repo:
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py mount agent-state
+python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py mount reconstruction-geometry
 ```
 
 This mounts into:
 
 ```text
-<git-root>/.agents/skills/agent-state
+<git-root>/.agents/skills/reconstruction-geometry
 ```
 
 Explicit project:
 
 ```bash
 python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
-  mount agent-state --project /path/to/repo
+  mount reconstruction-geometry --project /path/to/repo
 ```
+
+The category path in the source library does not appear in the runtime mount. A source at `3d_reconstruction_skills/reconstruction-geometry` still mounts as `.agents/skills/reconstruction-geometry`.
 
 ### Mount as a user skill
 
@@ -85,7 +99,7 @@ This targets `~/.agents/skills` unless `user_target` overrides it.
 ### Unmount
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount agent-state
+python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount reconstruction-geometry
 python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount skill-librarian --user
 ```
 
@@ -105,7 +119,7 @@ Without an explicit scope, `list` shows user scope and the current Git project's
 python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py doctor
 ```
 
-`doctor` checks missing libraries, duplicate skill names, broken/wrong links, real directories in managed targets, duplicate user/project mounts, malformed `SKILL.md` names, and project symlinks accidentally tracked by Git.
+`doctor` checks missing libraries, duplicate skill names, broken/wrong links, real directories in managed targets, duplicate user/project mounts, malformed `SKILL.md` names, project symlinks accidentally tracked by Git, and links that still point into ignored/retired source subtrees.
 
 ## Safety behavior
 
@@ -113,6 +127,8 @@ python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py doctor
 - `mount` refuses to replace a real directory/file.
 - `unmount` refuses to delete a real directory/file.
 - An existing wrong link is repaired only with `--force`.
+- Skills below ignored directories such as `retire_skills` are not available for mounting.
+- `doctor` fails when a runtime mount still points into an ignored/retired subtree.
 - Project mounts use absolute local paths, so they are normally **not committed** to the project repository.
 - Avoid mounting the same skill name at both user and project scope.
 
@@ -126,34 +142,22 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill NAME
 ```
 
-This is useful when one `deploy.json` intentionally defines a fixed set of runtime targets. For new Codex projects, prefer the explicit `mount`/`unmount` interface.
-
-## Portable skill conventions
-
-A self-contained skill normally looks like:
-
-```text
-<skill-name>/
-├── SKILL.md
-├── scripts/              # optional runnable code
-├── references/           # optional docs loaded on demand
-├── config.example.json   # optional committed config shape
-├── config.json           # optional machine-specific values, git-ignored
-├── .gitignore            # when needed
-└── README.md              # when human setup is non-trivial
-```
-
-Keep secrets and machine-specific paths out of committed files. Put skill-owned persistent state under `~/.local/state/skills/<skill-name>/` (or configured `state_root`), not inside source repositories.
+Legacy deployment uses the same recursive source discovery and ignore rules.
 
 ## Recommended ownership
 
 For a personal setup:
 
 ```text
-personal-agent-skills/       # Git source of truth for your skills
-skill_manager/               # management/migration tool
-~/.agents/skills/            # user-scoped links only
-<repo>/.agents/skills/       # project-scoped links only
+personal-agent-skills/                     # Git source of truth
+├── 3d_reconstruction_skills/              # optional category/group
+│   └── reconstruction-geometry/
+└── retire_skills/                         # ignored by discovery
+    └── agent-state/
+
+skill_manager/                             # management/migration tool
+~/.agents/skills/                          # user-scoped links only
+<repo>/.agents/skills/                     # project-scoped links only
 ```
 
-That keeps “what the skill is” in Git, while user/project directories only express where a skill is active.
+That keeps “what the skill is” in Git, while user/project directories only express where an active skill is mounted.
