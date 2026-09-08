@@ -12,21 +12,37 @@ central skill library Git repo
         +--> <repo>/.agents/skills/  Codex project scope
 ```
 
-The framework itself provides `skill-librarian`, while the user's own skills live in a separate Git-backed library such as `personal-agent-skills/skills`.
+The framework itself provides `skill-librarian`. A personal source library may be flat or grouped by category. Discovery recursively finds directories containing `SKILL.md`, stops at each skill boundary, skips hidden directories, and ignores `retire_skills` by default.
+
+Example:
+
+```text
+personal-agent-skills/
+├── 3d_reconstruction_skills/
+│   └── reconstruction-geometry/
+│       └── SKILL.md
+└── retire_skills/
+    └── agent-state/
+        └── SKILL.md
+```
+
+Only `reconstruction-geometry` is active/discoverable in this example. Runtime mounts stay flat: `.agents/skills/reconstruction-geometry`.
 
 ## Initial setup
 
 1. Confirm Python 3. `uv` is needed only by individual skills that declare isolated Python dependencies.
 2. Copy `deploy.example.json` to git-ignored `deploy.json` and use absolute paths.
-3. Put the user's personal library under `libraries`.
-4. For Codex, use `/Users/<username>/.agents/skills` as the user target.
-5. Preview changes before bulk deployment.
+3. Point `libraries` at the personal library root, not at one category folder.
+4. Keep `retire_skills` in `ignored_directories` unless retirement semantics are intentionally changed.
+5. For Codex, use `/Users/<username>/.agents/skills` as the user target.
+6. Preview changes before bulk deployment.
 
 Example:
 
 ```json
 {
-  "libraries": ["/Users/<username>/source/personal-agent-skills/skills"],
+  "libraries": ["/Users/<username>/source/personal-agent-skills"],
+  "ignored_directories": ["retire_skills"],
   "user_target": "/Users/<username>/.agents/skills",
   "targets": ["/Users/<username>/.agents/skills"]
 }
@@ -54,13 +70,6 @@ Default destination:
 <git-root>/.agents/skills/<skill>
 ```
 
-Explicit project:
-
-```bash
-python3 /absolute/path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
-  mount <skill> --project /absolute/path/to/repo
-```
-
 ### Mount to user scope
 
 ```bash
@@ -82,19 +91,21 @@ Use `--user` or `--project REPO` to select another scope.
 - `unmount` must remove links/junctions only; if a real file/directory is present, stop and report it.
 - `mount` must refuse to replace a real file/directory.
 - Use `--force` only to repair an existing wrong link after confirming intent.
+- Do not discover or mount skills below ignored source directories such as `retire_skills`.
+- `doctor` must fail when a runtime link still points into an ignored/retired subtree.
 - Avoid mounting the same skill name in both user and project scope.
 - Project mounts contain machine-specific absolute links and normally should not be committed.
-- Run `doctor` after moving libraries, changing configuration, or repairing mounts.
+- Run `doctor` after moving libraries, changing grouping folders, retiring skills, changing configuration, or repairing mounts.
 
 ## Migrating/filing skills
 
-When the user wants to move an existing skill into the central library, follow `skill-librarian/SKILL.md`. Audit dependencies and machine coupling first, make the result self-contained, verify it, then mount the verified library copy at the correct scope.
+When the user wants to move an existing skill into the central library, follow `skill-librarian/SKILL.md`. Category folders are organizational only. The actual skill name remains the basename of the directory containing `SKILL.md` and must match frontmatter `name`.
 
 Do not commit secrets or machine-specific `config.json` files.
 
 ## Legacy deployment
 
-`deploy.py` remains backward compatible:
+`deploy.py` remains backward compatible and uses the same recursive discovery/ignore rules:
 
 ```bash
 python3 deploy.py --dry-run
