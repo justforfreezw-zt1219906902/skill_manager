@@ -1,0 +1,10 @@
+interface:
+  display_name: Skill Librarian
+  short_description: Manage grouped Git-backed skill libraries and scoped mounts.
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

@@ -1,4 +1,6 @@
 {
-  "libraries": ["/Users/<username>/source/skill-library"],
-  "targets": ["/Users/<username>/.claude/skills", "/Users/<username>/.codex/skills"]
+  "libraries": ["/Users/<username>/source/personal-agent-skills"],
+  "ignored_directories": ["retire_skills"],
+  "user_target": "/Users/<username>/.agents/skills",
+  "targets": ["/Users/<username>/.agents/skills"]
 }
