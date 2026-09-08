@@ -23,13 +23,25 @@ class SkillLibrarianTests(unittest.TestCase):
         (self.framework / "skill-librarian" / "SKILL.md").write_text(
             "---\nname: skill-librarian\ndescription: test\n---\n"
         )
-        self.library = self.root / "library"
+
+        self.library = self.root / "personal-agent-skills"
         self.library.mkdir()
-        self.agent = self.library / "agent-state"
-        self.agent.mkdir()
-        (self.agent / "SKILL.md").write_text(
-            "---\nname: agent-state\ndescription: test\n---\n"
+        self.group = self.library / "3d_reconstruction_skills"
+        self.group.mkdir()
+        self.geometry = self.group / "reconstruction-geometry"
+        self.geometry.mkdir()
+        (self.geometry / "SKILL.md").write_text(
+            "---\nname: reconstruction-geometry\ndescription: test\n---\n"
         )
+
+        self.retired_group = self.library / "retire_skills"
+        self.retired_group.mkdir()
+        self.retired_agent = self.retired_group / "agent-state"
+        self.retired_agent.mkdir()
+        (self.retired_agent / "SKILL.md").write_text(
+            "---\nname: agent-state\ndescription: retired\n---\n"
+        )
+
         self.repo = self.root / "project"
         self.repo.mkdir()
         subprocess.run(["git", "init", str(self.repo)], check=True, capture_output=True)
@@ -51,44 +63,72 @@ class SkillLibrarianTests(unittest.TestCase):
         self.framework_patch.stop()
         self.tmp.cleanup()
 
-    def test_available_discovers_personal_library(self):
+    def test_available_discovers_nested_skill_and_ignores_retired(self):
         skills, clashes = cli.discover_skills()
-        self.assertEqual(set(skills), {"agent-state", "skill-librarian"})
+        self.assertEqual(set(skills), {"reconstruction-geometry", "skill-librarian"})
+        self.assertEqual(skills["reconstruction-geometry"], self.geometry.resolve())
+        self.assertNotIn("agent-state", skills)
         self.assertEqual(clashes, [])
 
+    def test_flat_layout_remains_supported(self):
+        flat = self.library / "flat-skill"
+        flat.mkdir()
+        (flat / "SKILL.md").write_text("---\nname: flat-skill\ndescription: test\n---\n")
+        skills, _ = cli.discover_skills()
+        self.assertEqual(skills["flat-skill"], flat.resolve())
+
+    def test_configured_ignored_directory_is_pruned(self):
+        archive = self.library / "archive"
+        archive.mkdir()
+        old = archive / "old-skill"
+        old.mkdir()
+        (old / "SKILL.md").write_text("---\nname: old-skill\ndescription: test\n---\n")
+        (self.framework / "deploy.json").write_text(
+            json.dumps(
+                {
+                    "libraries": [str(self.library)],
+                    "user_target": str(self.root / "user-skills"),
+                    "ignored_directories": ["retire_skills", "archive"],
+                }
+            )
+        )
+        skills, _ = cli.discover_skills()
+        self.assertNotIn("old-skill", skills)
+        self.assertNotIn("agent-state", skills)
+
     def test_project_mount_and_unmount_are_link_only(self):
-        self.assertEqual(cli.mount("agent-state", project=str(self.repo)), 0)
-        link = self.repo / ".agents" / "skills" / "agent-state"
+        self.assertEqual(cli.mount("reconstruction-geometry", project=str(self.repo)), 0)
+        link = self.repo / ".agents" / "skills" / "reconstruction-geometry"
         self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), self.agent.resolve())
-        self.assertEqual(cli.unmount("agent-state", project=str(self.repo)), 0)
+        self.assertEqual(link.resolve(), self.geometry.resolve())
+        self.assertEqual(cli.unmount("reconstruction-geometry", project=str(self.repo)), 0)
         self.assertFalse(os.path.lexists(link))
-        self.assertTrue(self.agent.exists())
+        self.assertTrue(self.geometry.exists())
 
     def test_user_mount(self):
-        self.assertEqual(cli.mount("agent-state", user=True), 0)
-        link = self.root / "user-skills" / "agent-state"
+        self.assertEqual(cli.mount("reconstruction-geometry", user=True), 0)
+        link = self.root / "user-skills" / "reconstruction-geometry"
         self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), self.agent.resolve())
+        self.assertEqual(link.resolve(), self.geometry.resolve())
 
     def test_mount_refuses_real_directory(self):
-        target = self.repo / ".agents" / "skills" / "agent-state"
+        target = self.repo / ".agents" / "skills" / "reconstruction-geometry"
         target.mkdir(parents=True)
         with self.assertRaises(cli.LibrarianError):
-            cli.mount("agent-state", project=str(self.repo))
+            cli.mount("reconstruction-geometry", project=str(self.repo))
         self.assertTrue(target.is_dir())
         self.assertFalse(target.is_symlink())
 
     def test_unmount_refuses_real_directory(self):
-        target = self.repo / ".agents" / "skills" / "agent-state"
+        target = self.repo / ".agents" / "skills" / "reconstruction-geometry"
         target.mkdir(parents=True)
         with self.assertRaises(cli.LibrarianError):
-            cli.unmount("agent-state", project=str(self.repo))
+            cli.unmount("reconstruction-geometry", project=str(self.repo))
         self.assertTrue(target.exists())
 
     def test_doctor_detects_duplicate_user_and_project_mount(self):
-        cli.mount("agent-state", user=True)
-        cli.mount("agent-state", project=str(self.repo))
+        cli.mount("reconstruction-geometry", user=True)
+        cli.mount("reconstruction-geometry", project=str(self.repo))
         cwd = os.getcwd()
         try:
             os.chdir(self.repo)
@@ -98,16 +138,22 @@ class SkillLibrarianTests(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_doctor_detects_tracked_project_mount(self):
-        cli.mount("agent-state", project=str(self.repo))
+        cli.mount("reconstruction-geometry", project=str(self.repo))
         subprocess.run(
-            ["git", "-C", str(self.repo), "add", ".agents/skills/agent-state"],
+            ["git", "-C", str(self.repo), "add", ".agents/skills/reconstruction-geometry"],
             check=True,
             capture_output=True,
         )
         self.assertEqual(cli.doctor(project=str(self.repo)), 1)
 
-    def test_doctor_healthy_for_project_only_mount(self):
-        cli.mount("agent-state", project=str(self.repo))
+    def test_doctor_flags_mount_into_retired_subtree(self):
+        target_dir = self.repo / ".agents" / "skills"
+        target_dir.mkdir(parents=True)
+        os.symlink(self.retired_agent.resolve(), target_dir / "agent-state")
+        self.assertEqual(cli.doctor(project=str(self.repo)), 1)
+
+    def test_doctor_healthy_for_nested_project_mount(self):
+        cli.mount("reconstruction-geometry", project=str(self.repo))
         self.assertEqual(cli.doctor(project=str(self.repo)), 0)
 
 
