@@ -5,6 +5,11 @@ Manage portable agent skills and link them into Codex/user/project scopes.
 The source skill library remains the source of truth. Runtime directories contain
 links, not copies, so edits or git pulls in the library propagate immediately.
 
+Configured library roots may contain skills directly or inside grouping folders.
+Discovery recurses until it reaches a directory containing SKILL.md, then treats
+that directory as a skill boundary. Directories named by ignored_directories are
+not scanned; retire_skills is ignored by default.
+
 Scoped commands:
 
     skill-librarian available
@@ -40,6 +45,7 @@ SKILL_DIR = SCRIPT_PATH.parent.parent
 FRAMEWORK_ROOT = SKILL_DIR.parent
 DEFAULT_TARGETS = ["~/.claude/skills", "~/.agents/skills"]
 DEFAULT_USER_TARGET = "~/.agents/skills"
+DEFAULT_IGNORED_DIRECTORIES = ("retire_skills",)
 SCOPED_COMMANDS = {"mount", "unmount", "list", "available", "doctor"}
 
 
@@ -47,14 +53,25 @@ class LibrarianError(RuntimeError):
     pass
 
 
+def _read_json(path):
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise LibrarianError(f"Cannot read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise LibrarianError(f"Configuration must be a JSON object: {path}")
+    return value
+
+
 def config():
-    cfg = FRAMEWORK_ROOT / "deploy.json"
-    if cfg.is_file():
-        try:
-            return json.loads(cfg.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            raise LibrarianError(f"Cannot read {cfg}: {exc}") from exc
-    return {}
+    return _read_json(FRAMEWORK_ROOT / "deploy.json")
+
+
+def local_skill_config():
+    return _read_json(SKILL_DIR / "config.json")
 
 
 def short(path):
@@ -67,21 +84,29 @@ def short(path):
     return path
 
 
+def ignored_directory_names():
+    """Return directory basenames that recursive skill discovery must prune."""
+    cfg = config()
+    local_cfg = local_skill_config()
+    raw = cfg.get("ignored_directories")
+    if raw is None:
+        raw = local_cfg.get("ignored_directories")
+    if raw is None:
+        raw = list(DEFAULT_IGNORED_DIRECTORIES)
+    if not isinstance(raw, list) or any(not isinstance(name, str) or not name.strip() for name in raw):
+        raise LibrarianError("ignored_directories must be a JSON list of non-empty directory names")
+    return {name.strip() for name in raw}
+
+
 def configured_library_roots(include_missing=False):
     roots = [FRAMEWORK_ROOT]
     roots.extend(Path(os.path.expanduser(p)).resolve() for p in config().get("libraries", []))
 
     # A standalone/deployed skill may not have the framework-level deploy.json.
     # Reuse its existing migration config as a fallback library declaration.
-    skill_cfg = SKILL_DIR / "config.json"
-    if skill_cfg.is_file():
-        try:
-            local_cfg = json.loads(skill_cfg.read_text())
-            library = local_cfg.get("skill_library_path")
-            if library:
-                roots.append(Path(os.path.expanduser(library)).resolve())
-        except (json.JSONDecodeError, OSError):
-            pass
+    library = local_skill_config().get("skill_library_path")
+    if library:
+        roots.append(Path(os.path.expanduser(library)).resolve())
 
     seen = set()
     out = []
@@ -95,20 +120,47 @@ def configured_library_roots(include_missing=False):
     return out
 
 
+def iter_skill_dirs(root):
+    """Yield lexical skill folders below root in deterministic relative-path order."""
+    root = Path(root).resolve()
+    ignored = ignored_directory_names()
+    found = []
+
+    def walk(directory):
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            raise LibrarianError(f"Cannot scan skill library directory {directory}: {exc}") from exc
+        for child in children:
+            if child.name.startswith(".") or child.name in ignored or not child.is_dir():
+                continue
+            if (child / "SKILL.md").is_file():
+                found.append(child)
+                # A skill is a discovery boundary. Do not treat nested resources as skills.
+                continue
+            # Do not recurse through grouping-directory symlinks. A symlink that is itself
+            # a skill is still accepted above for backward compatibility.
+            if child.is_symlink():
+                continue
+            walk(child)
+
+    walk(root)
+    found.sort(key=lambda p: p.relative_to(root).as_posix())
+    return found
+
+
 def discover_skills():
     """Return skill-name -> canonical source folder. First library wins."""
     found = {}
     clashes = []
     for root in configured_library_roots():
-        for child in sorted(root.iterdir(), key=lambda p: p.name):
-            if child.name.startswith(".") or not child.is_dir():
+        for child in iter_skill_dirs(root):
+            name = child.name
+            resolved = child.resolve()
+            if name in found:
+                clashes.append((name, found[name], resolved))
                 continue
-            if not (child / "SKILL.md").is_file():
-                continue
-            if child.name in found:
-                clashes.append((child.name, found[child.name], child))
-                continue
-            found[child.name] = child.resolve()
+            found[name] = resolved
     return found, clashes
 
 
@@ -267,6 +319,20 @@ def unmount(skill, user=False, project=None, dry_run=False):
     return 0
 
 
+def is_ignored_library_source(path):
+    """Return True when path is inside an ignored subtree of a configured library."""
+    resolved = Path(path).resolve()
+    ignored = ignored_directory_names()
+    for root in configured_library_roots():
+        try:
+            relative = resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if any(part in ignored for part in relative.parts):
+            return True
+    return False
+
+
 def describe_entry(entry, known_sources):
     current = link_target(entry)
     if current is not None:
@@ -276,6 +342,8 @@ def describe_entry(entry, known_sources):
         if expected == current:
             return "linked", current
         if expected is None:
+            if is_ignored_library_source(current):
+                return "retired-link", current
             return "external-link", current
         return "wrong-link", current
     if entry.is_dir():
@@ -420,6 +488,8 @@ def doctor(user=False, project=None):
                 issues.append(f"broken link: {short(entry)} -> {short(resolved)}")
             elif status == "wrong-link":
                 issues.append(f"wrong link: {short(entry)} -> {short(resolved)}")
+            elif status == "retired-link":
+                issues.append(f"retired skill is still mounted: {short(entry)} -> {short(resolved)}")
             elif status == "external-link":
                 notes.append(
                     f"external link not managed by configured libraries: {short(entry)} -> {short(resolved)}"
