@@ -1,41 +1,105 @@
-# skill-librarian — onboarding guide (for the agent)
+# skill-librarian — onboarding guide for agents
 
-You're in the **skill-librarian** repo: the framework for making agent skills self-contained and portable, then linking them into agent runtimes (Claude Code, Codex, and others). Each skill's folder is the source of truth; runtimes get symlinks (directory junctions on Windows), so an edit or a `git pull` propagates everywhere.
+This repository manages portable agent skills. Each skill's source folder is the source of truth; Codex/user/project runtime directories should normally contain symlinks (directory junctions on Windows), not independent copies.
 
-When the user asks you to **get started** or help them set this up, walk them through the onboarding below interactively, one step at a time, confirming before anything that writes or links.
+## Core model
 
-## Onboarding
+```text
+central skill library Git repo
+        |
+        +--> ~/.agents/skills/       Codex user scope
+        |
+        +--> <repo>/.agents/skills/  Codex project scope
+```
 
-1. **Prerequisites.** Confirm Python 3 (`python3 --version`) for `deploy.py`, and `uv` (`uv --version`) — the default for isolating skills' Python dependencies (`brew install uv`, or https://docs.astral.sh/uv/). Migrated skills declare their deps inline and run via `uv run`, so nothing installs into the global/system Python.
+The framework itself provides `skill-librarian`, while the user's own skills live in a separate Git-backed library such as `personal-agent-skills/skills`.
 
-2. **Pick deploy targets + libraries.** Copy the example config:
-   ```bash
-   cp deploy.example.json deploy.json
-   ```
-   Then edit `deploy.json` with the user (absolute paths, no `~`):
-   - `targets` — the runtime skill dirs to deploy into. Defaults are `~/.claude/skills` and `~/.codex/skills`; keep whichever runtimes they actually use.
-   - `libraries` — repos of *their own* skills to deploy alongside skill-librarian. If they don't have one yet, leave it `[]`; they can add it after step 5.
+## Initial setup
 
-   `deploy.json` is git-ignored, since it's machine-specific.
+1. Confirm Python 3. `uv` is needed only by individual skills that declare isolated Python dependencies.
+2. Copy `deploy.example.json` to git-ignored `deploy.json` and use absolute paths.
+3. Put the user's personal library under `libraries`.
+4. For Codex, use `/Users/<username>/.agents/skills` as the user target.
+5. Preview changes before bulk deployment.
 
-3. **Preview, then deploy.**
-   ```bash
-   python3 deploy.py --dry-run   # show what it will link, change nothing
-   python3 deploy.py             # create the links
-   ```
-   This links `skill-librarian` (and any configured libraries) into the targets. If a target already holds a real (drifted) copy of a skill, deploy prompts before replacing it. It never deletes a real directory without a yes.
+Example:
 
-4. **Confirm it loaded.** Have the user reload their agent and check that `skill-librarian` shows up in its available skills.
+```json
+{
+  "libraries": ["/Users/<username>/source/personal-agent-skills/skills"],
+  "user_target": "/Users/<username>/.agents/skills",
+  "targets": ["/Users/<username>/.agents/skills"]
+}
+```
 
-5. **Show them the point.** Now they can make their *own* skills portable. Point skill-librarian at a skill folder: *"skill-librarian: bring `~/path/to/some-skill` into the library."* It migrates the skill (vendors its scripts, lifts secrets and absolute paths into a git-ignored `config.json`, moves state to `~/.local/state/skills/<name>/`, then verifies by actually running it) and offers to deploy it.
-   - If they don't have a private skill library yet, offer to create one: a git repo that holds skill folders. Add its path to `deploy.json`'s `libraries`, then run `python3 deploy.py`.
+## Preferred scoped management
 
-## Where the detail lives
+Use the bundled deterministic CLI instead of writing `ln -s` manually:
 
-- `README.md` — the conventions: what "self-contained" means, the config/state rules, and how `deploy.py` works.
-- `skill-librarian/SKILL.md` — how a migration runs (its seven phases — including a human sign-off gate after the audit and a full end-to-end run by a fresh subagent), with `references/` holding a worked example and copy-paste recipes.
+```bash
+python3 skill-librarian/scripts/skill_librarian.py available
+python3 skill-librarian/scripts/skill_librarian.py list
+python3 skill-librarian/scripts/skill_librarian.py doctor
+```
 
-## Ground rules
+### Mount to current project
 
-- Show the user before you link, replace, or delete anything. `deploy.py --dry-run` previews, and deploy prompts before touching a real directory.
-- This is the public framework repo and carries no personal data. The user's own skills belong in a separate, private library that `deploy.json` points at.
+```bash
+python3 /absolute/path/to/skill_manager/skill-librarian/scripts/skill_librarian.py mount <skill>
+```
+
+Default destination:
+
+```text
+<git-root>/.agents/skills/<skill>
+```
+
+Explicit project:
+
+```bash
+python3 /absolute/path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
+  mount <skill> --project /absolute/path/to/repo
+```
+
+### Mount to user scope
+
+```bash
+python3 /absolute/path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
+  mount <skill> --user
+```
+
+### Unmount
+
+```bash
+python3 /absolute/path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount <skill>
+```
+
+Use `--user` or `--project REPO` to select another scope.
+
+## Safety rules
+
+- Never delete or overwrite the canonical source skill during mount/unmount.
+- `unmount` must remove links/junctions only; if a real file/directory is present, stop and report it.
+- `mount` must refuse to replace a real file/directory.
+- Use `--force` only to repair an existing wrong link after confirming intent.
+- Avoid mounting the same skill name in both user and project scope.
+- Project mounts contain machine-specific absolute links and normally should not be committed.
+- Run `doctor` after moving libraries, changing configuration, or repairing mounts.
+
+## Migrating/filing skills
+
+When the user wants to move an existing skill into the central library, follow `skill-librarian/SKILL.md`. Audit dependencies and machine coupling first, make the result self-contained, verify it, then mount the verified library copy at the correct scope.
+
+Do not commit secrets or machine-specific `config.json` files.
+
+## Legacy deployment
+
+`deploy.py` remains backward compatible:
+
+```bash
+python3 deploy.py --dry-run
+python3 deploy.py
+python3 deploy.py --skill <name>
+```
+
+Prefer scoped `mount`/`unmount` for new Codex workflows because ownership is explicit.
