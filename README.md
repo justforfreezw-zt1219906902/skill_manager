@@ -5,6 +5,10 @@ A small framework for maintaining **portable agent skills** with one source of t
 The intended model is:
 
 ```text
+external/local skill sources
+        |
+        +--> import + provenance
+        |
 personal-agent-skills/                  canonical Git source of truth
         |
         +--> skill_manager              control plane
@@ -23,7 +27,7 @@ Runtime directories are deployment views. Managed skills are symlinks on macOS/L
 ## Requirements
 
 - Python 3
-- Git for project-scoped mounts
+- Git for project-scoped mounts and Git-backed imports
 - `uv` only when an individual migrated skill uses isolated Python dependencies
 
 ## Configuration
@@ -101,7 +105,7 @@ python3 skill-librarian/scripts/skill_librarian.py list
 python3 skill-librarian/scripts/skill_librarian.py doctor
 ```
 
-For compatibility with v0.2, scoped commands target **Codex by default**. Select another runtime with `--agent` / `-a`, repeat it for multiple runtimes, or use `--agent all`. `adopt` is intentionally single-runtime because it takes ownership of one concrete runtime entry.
+For compatibility with v0.2, runtime-scoped commands target **Codex by default**. Select another runtime with `--agent` / `-a`, repeat it for multiple runtimes, or use `--agent all`. `adopt` is intentionally single-runtime because it takes ownership of one concrete runtime entry. `import` is not runtime-scoped: it creates a canonical asset only.
 
 ### Mount to a project
 
@@ -220,11 +224,77 @@ python3 skill-librarian/scripts/skill_librarian.py \
   adopt downloaded-skill --user --dry-run
 ```
 
-`adopt` accepts exactly one runtime entry and only when its current status is `UNMANAGED`. It validates the runtime basename, `SKILL.md` name, destination category, configured library ownership, and internal links before mutating anything. The copy is staged and revalidated first; only then is the unmanaged runtime entry replaced with a managed link. If creating the managed link fails, the original runtime entry and canonical destination are rolled back.
+`adopt` accepts exactly one runtime entry and only when its current status is `UNMANAGED`. It validates the runtime basename, `SKILL.md` name, destination category, configured library ownership, and internal links before mutating anything. The copy is staged and revalidated first; only then is the unmanaged runtime entry replaced with a managed link. If creating the managed link or final verification fails, the original runtime entry and canonical destination are rolled back.
 
 If the unmanaged runtime entry is itself a symlink to an external skill source, `adopt` copies that source into the canonical library, replaces only the runtime link, and leaves the external source untouched.
 
-For portability, the first version of `adopt` refuses broken/external internal links, absolute internal symlinks, and junction/reparse-point dependencies inside the skill tree. Clean or vendor those dependencies before adopting.
+For portability, `adopt` refuses broken/external internal links, absolute internal symlinks, and junction/reparse-point dependencies inside the skill tree. Clean or vendor those dependencies before adopting.
+
+## Import external skills with provenance
+
+Use `import` when the skill is **not already an unmanaged runtime install** and you want to turn an external/local source into a reviewed canonical asset first.
+
+GitHub shorthand:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  import vercel-labs/agent-skills --skill frontend-design
+```
+
+Repository URL with an explicit revision:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  import https://github.com/acme/skills --skill postgres-review --ref v1.2.0
+```
+
+A common GitHub tree/blob URL can also identify the skill path. For branch names containing `/`, prefer a repository-root URL plus `--ref` because path/ref boundaries in tree URLs are ambiguous without GitHub API resolution.
+
+Local source:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  import /path/to/source-repo --skill postgres-review --category database_skills
+```
+
+Preview acquisition and validation without writing:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  import vercel-labs/agent-skills --skill frontend-design --dry-run
+```
+
+`import` deliberately **does not mount the skill**. After review, activate it explicitly:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount frontend-design --user --agent codex
+```
+
+The imported skill receives `.skill-source.json`. Schema version 1 records:
+
+```json
+{
+  "schema_version": 1,
+  "type": "git",
+  "source": "https://github.com/acme/skills.git",
+  "source_path": "skills/postgres-review",
+  "ref": "v1.2.0",
+  "revision": "<exact-git-sha>",
+  "dirty": false,
+  "skill": "postgres-review",
+  "acquired_via": "git",
+  "imported_at": "<UTC timestamp>"
+}
+```
+
+Provenance is intentionally sanitized: URL credentials, query strings, and fragments are removed; machine-local `file://` paths are not persisted. A plain local non-Git source records `source: null`. A local Git working tree records its exact current revision plus `dirty: true` when local changes/untracked files are part of the imported snapshot.
+
+Import currently accepts existing local directories, GitHub `owner/repo`, GitHub repository/tree/blob URLs, and ordinary Git URLs. GitHub shorthand uses HTTPS; for private repositories where HTTPS Git credentials are not configured, pass an authenticated Git/SSH URL explicitly.
+
+Safety checks happen before canonical ownership changes. Import rejects duplicate canonical names, hidden/ignored/escaping destination categories, non-portable links, `.env`-style secret files, and common machine-local dependency/cache directories such as `.venv` and `node_modules`. Nested VCS metadata such as `.git` is stripped from the canonical copy. Incoming `.skill-source.json` is not trusted; the importer writes fresh provenance after acquisition.
+
+This acquisition layer is intentionally independent of `npx skills add`: external tools may still be used for discovery, but `skill_manager import` avoids installing into runtime directories while establishing canonical ownership.
 
 ## Runtime inspection and unmanaged detection
 
@@ -288,7 +358,9 @@ The same skill mounted into Codex and Claude Code is expected and is **not** tre
 - `adopt` is the explicit ownership transition from `UNMANAGED` runtime state to a canonical source plus managed runtime link.
 - `adopt` never overwrites an existing canonical skill or destination.
 - `adopt` requires a configured external canonical library and never adopts into the `skill_manager` framework root.
-- `adopt` rejects runtime path traversal, hidden/ignored destination categories, and non-portable internal links.
+- `import` creates a canonical asset only; runtime activation remains a separate `mount` decision.
+- `import` never overwrites an existing canonical skill and records sanitized provenance for later diff/update work.
+- `adopt` and `import` reject path traversal, hidden/ignored destination categories, and non-portable internal links.
 - An existing wrong link is repaired only with `--force`.
 - Skills below ignored directories such as `retire_skills` are not available for mounting.
 - `doctor` fails when a runtime still points into an ignored/retired source subtree.
@@ -305,7 +377,7 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill NAME
 ```
 
-Legacy deployment still uses the `targets` array and the same recursive source discovery/ignore rules. New workflows should use scoped `mount`, `unmount`, and `adopt` commands plus runtime adapters instead.
+Legacy deployment still uses the `targets` array and the same recursive source discovery/ignore rules. New workflows should use `import`/`adopt` for ownership and scoped `mount`/`unmount` plus runtime adapters for activation.
 
 ## Recommended ownership
 
@@ -313,7 +385,7 @@ For a personal setup:
 
 ```text
 personal-agent-skills/                     # Git source of truth
-├── imported/                              # default home for adopted skills
+├── imported/                              # default home for adopted/imported skills
 ├── 3d_reconstruction_skills/
 │   └── reconstruction-geometry/
 └── retire_skills/                         # ignored by discovery
@@ -326,7 +398,7 @@ skill_manager/                             # control plane
 <repo>/.claude/skills/                     # Claude Code project links only
 ```
 
-That keeps **what the skill is** in Git while runtime directories express only **where an active skill is mounted**.
+That keeps **what the skill is and where it came from** in Git while runtime directories express only **where an active skill is mounted**.
 
 ## Roadmap
 
@@ -334,5 +406,5 @@ That keeps **what the skill is** in Git while runtime directories express only *
 v0.3  runtime adapters + unmanaged detection
 v0.4  adopt unmanaged runtime skills into the canonical library
 v0.5  import external skills + provenance metadata
-v0.6  upstream diff / update
+v0.6  upstream diff / update using provenance
 ```
