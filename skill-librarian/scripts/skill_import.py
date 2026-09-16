@@ -16,8 +16,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-import skill_source
 
+def _load_skill_source_module():
+    try:
+        import skill_source as module
+        return module
+    except ModuleNotFoundError:
+        module_path = Path(__file__).resolve().with_name("skill_source.py")
+        spec = importlib.util.spec_from_file_location("skill_source", module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("skill_source", module)
+        spec.loader.exec_module(module)
+        return module
+
+
+skill_source = _load_skill_source_module()
 
 DEFAULT_IMPORT_CATEGORY = "imported"
 _TRANSIENT_DIRS = {".venv", "node_modules", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache"}
