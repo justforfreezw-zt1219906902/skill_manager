@@ -46,33 +46,8 @@ class AcquiredSource:
     path_hint: Path | None = None
 
 
-def _run_git(args, cwd=None, check=True):
-    cmd = ["git", *args]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd is not None else None,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise SourceError("git is required for Git-backed skill imports") from exc
-
-    if check and proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "git command failed").strip()
-        raise SourceError(f"{' '.join(cmd)}: {detail}")
-    return proc
-
-
-def _looks_like_local_path(source):
-    expanded = Path(os.path.expanduser(source))
-    if expanded.exists():
-        return True
-    return source.startswith((".", "/", "~")) or (os.name == "nt" and len(source) >= 2 and source[1] == ":")
-
-
 def sanitize_recorded_source(source):
-    """Remove credentials/machine-local details before provenance is committed."""
+    """Remove credentials/machine-local details before provenance or errors are exposed."""
     if not isinstance(source, str) or not source:
         return source
 
@@ -82,7 +57,7 @@ def sanitize_recorded_source(source):
 
     parsed = urlsplit(source)
     if parsed.scheme == "file":
-        # Never commit a machine-specific absolute filesystem URL into canonical provenance.
+        # Never commit or report a machine-specific absolute filesystem URL as provenance.
         return None
     if parsed.scheme not in {"http", "https", "ssh", "git"}:
         return source
@@ -96,6 +71,37 @@ def sanitize_recorded_source(source):
     else:
         netloc = hostname
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _run_git(args, cwd=None, check=True, sensitive_values=()):
+    cmd = ["git", *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SourceError("git is required for Git-backed skill imports") from exc
+
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "git command failed").strip()
+        for raw in sensitive_values:
+            if not raw:
+                continue
+            safe = sanitize_recorded_source(raw) or "<local-source>"
+            detail = detail.replace(raw, safe)
+        operation = args[0] if args else "command"
+        raise SourceError(f"git {operation} failed: {detail}")
+    return proc
+
+
+def _looks_like_local_path(source):
+    expanded = Path(os.path.expanduser(source))
+    if expanded.exists():
+        return True
+    return source.startswith((".", "/", "~")) or (os.name == "nt" and len(source) >= 2 and source[1] == ":")
 
 
 def _parse_remote_source(source, ref=None):
@@ -212,7 +218,10 @@ def acquire_source(source, ref=None):
     clone_url, effective_ref, path_hint = _parse_remote_source(source, ref=ref)
     with tempfile.TemporaryDirectory(prefix="skill-librarian-import-") as tmp:
         checkout = Path(tmp) / "source"
-        _run_git(["clone", "--quiet", clone_url, str(checkout)])
+        _run_git(
+            ["clone", "--quiet", clone_url, str(checkout)],
+            sensitive_values=(clone_url,),
+        )
         _checkout_ref(checkout, effective_ref)
         yield AcquiredSource(
             root=checkout.resolve(),
