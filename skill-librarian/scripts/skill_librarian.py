@@ -16,13 +16,15 @@ Scoped commands:
     skill-librarian mount NAME [--user | --project REPO] [-a RUNTIME]
     skill-librarian unmount NAME [--user | --project REPO] [-a RUNTIME]
     skill-librarian adopt NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian import SOURCE --skill NAME [--ref REF]
     skill-librarian list [--user | --project REPO] [-a RUNTIME] [--json]
     skill-librarian doctor [--user | --project REPO] [-a RUNTIME]
 
 Runtime defaults preserve the v0.2 behavior: scoped commands target Codex unless
 --agent is supplied. Repeat --agent to target more than one runtime, or use
 --agent all. Built-in adapters are codex and claude-code. adopt is intentionally
-single-runtime because it takes ownership of one concrete runtime entry.
+single-runtime because it takes ownership of one concrete runtime entry. import
+creates a canonical asset only and never mounts it into a runtime.
 
 For mount/unmount/adopt, omitting a scope means the current Git repository.
 For list/doctor, omitting a scope inspects user scope plus the current Git
@@ -34,10 +36,11 @@ The script also keeps the old bulk-deploy interface used by deploy.py:
     python3 deploy.py --dry-run
     python3 deploy.py --skill NAME
 
-Requires Python 3. Standard library only.
+Requires Python 3. Standard library only. Git-backed imports also require Git.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -1375,6 +1378,17 @@ def scoped_main(argv):
     return args.handler(args)
 
 
+def import_main(argv):
+    """Load the acquisition workflow lazily so normal runtime commands stay lightweight."""
+    module_path = SCRIPT_PATH.with_name("skill_import.py")
+    spec = importlib.util.spec_from_file_location("skill_librarian_import", module_path)
+    if spec is None or spec.loader is None:
+        raise LibrarianError(f"Cannot load import workflow from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main(argv, control=sys.modules[__name__])
+
+
 def legacy_main(argv):
     parser = argparse.ArgumentParser(
         description="Link skills from this repo + configured libraries into runtime skill dirs."
@@ -1388,6 +1402,8 @@ def legacy_main(argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if argv and argv[0] == "import":
+            return import_main(argv[1:])
         if argv and argv[0] in SCOPED_COMMANDS:
             return scoped_main(argv)
         return legacy_main(argv)
