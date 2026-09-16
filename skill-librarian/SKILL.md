@@ -1,6 +1,6 @@
 ---
 name: skill-librarian
-description: Manage a Git-backed central agent-skill library and make skills portable across Codex, Claude Code, and other runtimes. Use when the user wants to add/migrate a skill into the library, organize skills into category folders, retire skills, list available skills, mount or unmount a skill at user scope or project scope, inspect installed/mounted skills, repair links, or diagnose skill-library problems. Supports recursive grouped source libraries, ignored retirement folders, Codex user skills at ~/.agents/skills, and project skills under a repository .agents/skills directory while keeping the source library authoritative.
+description: Manage a Git-backed central agent-skill library and deploy skills safely across Codex and Claude Code runtime scopes. Use when the user wants to add/migrate a skill into the library, organize or retire skills, list available skills, mount/unmount at user or project scope, inspect runtime state, detect unmanaged skills, repair links, or diagnose skill-library problems. Supports recursive grouped source libraries, ignored retirement folders, Codex and Claude Code runtime adapters, strict runtime status classification, and JSON inspection while keeping the central library authoritative.
 ---
 
 # Skill Librarian
@@ -10,16 +10,23 @@ Treat the central skill library as the source of truth. Runtime skill directorie
 Use this model:
 
 ```text
-central skill Git repo
+personal-agent-skills/                  canonical Git source of truth
         |
         +-- category folders (optional)
         +-- retire_skills/ (ignored by default)
         |
-        +--> ~/.agents/skills/       user scope
-        +--> <repo>/.agents/skills/  project scope
+        +--> skill_manager              control plane
+                 |
+                 +--> CodexAdapter
+                 |      +--> ~/.agents/skills/
+                 |      +--> <repo>/.agents/skills/
+                 |
+                 +--> ClaudeCodeAdapter
+                        +--> ~/.claude/skills/
+                        +--> <repo>/.claude/skills/
 ```
 
-Keep normal skill edits in the central source library. Do not edit mounted copies as if they were independent sources.
+Keep normal skill edits in the central source library. Do not edit mounted copies as independent sources.
 
 ## Source-library organization
 
@@ -39,30 +46,59 @@ personal-agent-skills/
 
 The deterministic CLI searches configured library roots recursively. A directory containing `SKILL.md` is a skill boundary; use its basename as the skill name and do not discover anything below it. Skip hidden directories. Ignore `retire_skills` by default.
 
-Category folder names are organizational only. A source at `3d_reconstruction_skills/reconstruction-geometry` mounts as `.agents/skills/reconstruction-geometry`.
+Category folder names are organizational only. Runtime mounts stay flat by skill basename.
 
 ## Configuration
 
 `config.json` in this skill is machine-specific and git-ignored. Copy `config.example.json` when needed.
 
-Supported keys:
+Supported local keys:
 
 - `skill_library_path`: absolute path to the user's central skill-library root.
 - `ignored_directories`: source-directory basenames to prune during recursive discovery. Defaults to `["retire_skills"]`.
 - `state_root`: absolute path for skill-owned persistent state used by migration workflows.
 
-The framework-level `deploy.json` may additionally contain:
+The framework-level `deploy.json` may contain:
 
 ```json
 {
   "libraries": ["/absolute/path/to/personal-agent-skills"],
   "ignored_directories": ["retire_skills"],
-  "user_target": "/Users/<username>/.agents/skills",
-  "targets": ["/Users/<username>/.agents/skills"]
+  "runtimes": {
+    "codex": {"enabled": true},
+    "claude-code": {"enabled": true}
+  },
+  "targets": [
+    "/Users/<username>/.agents/skills",
+    "/Users/<username>/.claude/skills"
+  ]
 }
 ```
 
-Framework `deploy.json` takes precedence for `ignored_directories`; a standalone/deployed `skill-librarian` falls back to its local `config.json`.
+Runtime defaults:
+
+| Runtime | User scope | Project scope |
+| --- | --- | --- |
+| Codex | `~/.agents/skills` | `<repo>/.agents/skills` |
+| Claude Code | `~/.claude/skills` | `<repo>/.claude/skills` |
+
+Optional per-runtime overrides:
+
+```json
+{
+  "runtimes": {
+    "codex": {
+      "enabled": true,
+      "user_target": "/absolute/custom/codex/skills",
+      "project_target": ".agents/skills"
+    }
+  }
+}
+```
+
+Runtime `user_target` must be absolute (or `~`-based). `project_target` must be a relative subdirectory that stays inside the Git root. Unknown runtime names/config keys are errors. `targets` remains legacy bulk-deploy configuration.
+
+Framework `deploy.json` takes precedence for `ignored_directories`; a standalone/deployed `skill-librarian` falls back to local `config.json`.
 
 Use absolute paths in machine config. Never put secrets in committed files.
 
@@ -80,50 +116,50 @@ Then use:
 
 ```bash
 python "$SKILL_DIR/scripts/skill_librarian.py" available
-python "$SKILL_DIR/scripts/skill_librarian.py" list
-python "$SKILL_DIR/scripts/skill_librarian.py" doctor
+python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all
+python "$SKILL_DIR/scripts/skill_librarian.py" doctor --agent all
 ```
+
+Codex is the default runtime for compatibility. Use `--agent codex`, `--agent claude-code`, repeat `--agent`, or use `--agent all`.
 
 ### Mount a project skill
 
-From inside the target Git repo:
+Codex default:
 
 ```bash
 python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill>
 ```
 
-This defaults to:
-
-```text
-<git-root>/.agents/skills/<skill>
-```
-
-Or specify the repo explicitly:
+Claude Code:
 
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --project /absolute/path/to/repo
+python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --agent claude-code
+```
+
+Both supported runtimes:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --agent all
+```
+
+Explicit repo:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  mount <skill> --project /absolute/path/to/repo --agent all
 ```
 
 ### Mount a user skill
 
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --user
+python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --user --agent all
 ```
-
-This targets `~/.agents/skills/<skill>` unless `user_target` overrides it.
 
 ### Unmount
 
-Project scope:
-
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" unmount <skill>
-```
-
-User scope:
-
-```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" unmount <skill> --user
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  unmount <skill> --user --agent codex
 ```
 
 `unmount` removes links/junctions only. If the target is a real directory or file, stop and report it; never delete it automatically.
@@ -136,35 +172,56 @@ python "$SKILL_DIR/scripts/skill_librarian.py" available
 
 List active canonical source skills only. Do not list skills below ignored directories such as `retire_skills`.
 
+### Runtime inspection
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all
+python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all --json
+```
+
+Statuses:
+
+- `MANAGED`: runtime entry points at the canonical active source.
+- `UNMANAGED`: real path or external link exists in a runtime directory but is not owned by configured libraries.
+- `BROKEN_LINK`: link target is missing outside configured libraries.
+- `WRONG_LINK`: canonical skill name exists, but runtime link points elsewhere.
+- `RETIRED`: runtime still points into an ignored/retired source subtree.
+- `MISSING_SOURCE`: runtime points into a managed library location whose source disappeared.
+
+A skill installed directly by Codex, Claude Code, `npx skills`, or another tool is intentionally `UNMANAGED` until a deliberate adoption workflow brings it into the canonical library.
+
 ### Doctor
 
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" doctor
+python "$SKILL_DIR/scripts/skill_librarian.py" doctor --agent all
 ```
 
-Use it after changing libraries, regrouping skills, retiring skills, moving repos, or mounting/unmounting skills. It checks for:
+Use it after changing libraries, regrouping skills, retiring skills, moving repos, changing runtime config, or mounting/unmounting skills. It checks for:
 
 - missing configured libraries;
 - malformed or mismatched `SKILL.md` names;
 - duplicate active skill names across source paths;
-- broken or wrong links;
-- links that still point into ignored/retired source subtrees;
-- real files/directories where managed links are expected;
-- the same skill mounted at both user and project scope;
+- unmanaged runtime entries;
+- broken, wrong, retired, or missing-source links;
+- invalid runtime configuration;
+- runtime target collisions;
+- the same skill mounted at both user and project scope inside one runtime;
 - project mounts accidentally tracked by Git.
 
-Read `references/skill-management.md` for exact discovery, scope, retirement, and safety behavior.
+Read `references/skill-management.md` for exact discovery, runtime, status, and safety behavior.
 
 ## Safety rules for mount management
 
 - Treat source skill folders as immutable from mount/unmount operations.
 - Never copy a skill merely to deploy it unless symlinks/junctions are impossible and the user explicitly asks for a copy.
-- Never replace a real target directory automatically.
-- Only use `--force` to repair an existing link that points at the wrong active source, after confirming that repair is intended.
+- Never replace an unmanaged real target automatically.
+- Multi-runtime operations must preflight all selected targets before mutation.
+- Reject selected runtime/scope targets that resolve to the same physical directory.
+- Only use `--force` to repair an existing wrong link that points at the wrong active source, after confirming that repair is intended.
 - Do not mount skills from ignored/retired source folders.
 - If `doctor` reports a retired link, unmount it explicitly; do not silently relink it elsewhere.
 - Project mounts are normally local machine state because they point to absolute source paths. Do not commit those links unless the project explicitly wants that machine-specific behavior.
-- If a skill is mounted at user scope, normally do not also mount the same name at project scope.
+- The same skill may be mounted in Codex and Claude Code. Normally do not mount the same skill at both user and project scope within one runtime.
 
 ## Legacy bulk deployment
 
@@ -176,7 +233,7 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill <name>
 ```
 
-Legacy deployment uses the same recursive discovery and ignore rules. Prefer scoped `mount`/`unmount` commands for new Codex workflows because they make user-vs-project ownership explicit.
+Legacy deployment uses the `targets` array plus the same recursive discovery and ignore rules. Prefer scoped `mount`/`unmount` commands with runtime adapters for new workflows.
 
 ## Migrating or filing a skill into the library
 
@@ -237,7 +294,7 @@ Perform the checks that match the migrated skill:
 - confirm secrets/config are git-ignored;
 - run a bounded end-to-end task when practical;
 - run `available` and confirm the nested source is discovered under the expected skill name;
-- run `doctor` and resolve duplicate names or stale retired mounts.
+- run `doctor --agent all` and resolve duplicate names, unmanaged runtime entries, or stale retired mounts.
 
 Do not report migration success when the migrated skill has not been exercised enough to prove that it works from its new location.
 
@@ -246,34 +303,32 @@ Do not report migration success when the migrated skill has not been exercised e
 After verification, use the scoped CLI to mount it where it belongs:
 
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --user
+python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --user --agent codex
 ```
 
 or:
 
 ```bash
-python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --project /path/to/repo
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  mount <skill> --project /path/to/repo --agent all
 ```
 
-Do not automatically mount every new skill globally. Choose scope based on reuse:
-
-- broadly reusable across projects -> user scope;
-- relevant only to one repository/workflow -> project scope.
+Do not automatically mount every new skill globally. Choose scope and runtime based on reuse.
 
 ## Retiring a skill
 
 When the user intentionally retires a skill:
 
-1. Unmount it from user/project scopes first, or move it and immediately run `doctor` to identify stale mounts.
+1. Unmount it from active runtime scopes first, or move it and immediately run `doctor --agent all` to identify stale mounts.
 2. Move the canonical source folder under `retire_skills/`.
 3. Run `available` and confirm it is absent.
-4. Run `doctor` and remove any reported `retired-link` mounts explicitly.
+4. Run `doctor --agent all` and remove any reported `RETIRED` mounts explicitly.
 
 Retirement changes availability only; it does not delete source history.
 
 ## References
 
-- `references/skill-management.md` — recursive discovery, mount/unmount/list/available/doctor behavior and safety rules.
+- `references/skill-management.md` — recursive discovery, runtime adapters, status classification, mount/unmount/list/available/doctor behavior, and safety rules.
 - `references/case-study-daily-summary.md` — full migration example.
 - `references/migration-recipes.md` — migration patterns for config, paths, state, and vendoring.
 - `references/determinism-audit.md` — deciding when mechanical workflow steps should be compiled into scripts.
