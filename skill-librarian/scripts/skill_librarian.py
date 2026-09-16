@@ -749,6 +749,17 @@ def parse_frontmatter_name(skill_md):
     return None
 
 
+def validate_adopt_skill_name(skill):
+    """Require one simple runtime basename so adopt cannot traverse outside its scope."""
+    if not isinstance(skill, str) or not skill.strip():
+        raise LibrarianError("adopt skill name must be a non-empty basename")
+    if skill != skill.strip() or skill in {".", ".."} or skill.startswith("."):
+        raise LibrarianError(f"Invalid adopt skill name: {skill!r}")
+    if "/" in skill or "\\" in skill or Path(skill).name != skill:
+        raise LibrarianError(f"adopt skill name must be a basename, not a path: {skill!r}")
+    return skill
+
+
 def configured_adopt_libraries():
     """Return configured canonical libraries excluding the framework repo itself."""
     framework = FRAMEWORK_ROOT.resolve(strict=False)
@@ -847,8 +858,24 @@ def validate_adopt_skill_tree(source, skill):
     for current, dirnames, filenames in os.walk(source, followlinks=False):
         for name in list(dirnames) + list(filenames):
             child = Path(current) / name
-            if not child.is_symlink() and link_target(child) is None:
+            linked_target = link_target(child)
+            if child.is_symlink():
+                try:
+                    raw_target = os.readlink(child)
+                except OSError as exc:
+                    raise LibrarianError(f"Cannot inspect internal link {short(child)}: {exc}") from exc
+                if Path(raw_target).is_absolute():
+                    raise LibrarianError(
+                        f"Cannot adopt absolute internal link: {short(child)} -> {raw_target}"
+                    )
+            elif linked_target is not None:
+                # Junctions/reparse points preserve machine-local absolute targets when copied.
+                raise LibrarianError(
+                    f"Cannot adopt non-portable junction/reparse point inside skill tree: {short(child)}"
+                )
+            else:
                 continue
+
             if not child.exists():
                 raise LibrarianError(f"Cannot adopt broken internal link: {short(child)}")
             target = child.resolve(strict=False)
@@ -871,6 +898,7 @@ def adopt(
     dry_run=False,
 ):
     """Take ownership of one UNMANAGED runtime skill and replace it with a managed link."""
+    validate_adopt_skill_name(skill)
     adapters = runtime_adapters(agents)
     if len(adapters) != 1:
         names = ", ".join(adapter.name for adapter in adapters)
