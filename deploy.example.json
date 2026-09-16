@@ -1,5 +1,5 @@
 {
-  "libraries": ["/Users/<username>/source/personal-agent-skills"],
+  "libraries": ["/Users/zhaowei/ai_general_tools/personal-agent-skills"],
   "ignored_directories": ["retire_skills"],
   "runtimes": {
     "codex": {
@@ -10,7 +10,7 @@
     }
   },
   "targets": [
-    "/Users/<username>/.agents/skills",
-    "/Users/<username>/.claude/skills"
+    "/Users/zhaowei/.agents/skills",
+    "/Users/zhaowei/.claude/skills"
   ]
 }
