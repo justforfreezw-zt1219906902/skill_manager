@@ -188,6 +188,21 @@ class AdoptTests(unittest.TestCase):
         self.assertTrue(runtime_skill.is_dir())
         self.assertFalse((self.root / "outside" / "foo").exists())
 
+    def test_adopt_rejects_category_inside_existing_skill_boundary(self):
+        boundary = self.library / "existing-skill"
+        boundary.mkdir()
+        (boundary / "SKILL.md").write_text(
+            "---\nname: existing-skill\ndescription: boundary\n---\n"
+        )
+        runtime_skill = self.make_runtime_skill("foo")
+
+        with self.assertRaises(cli.LibrarianError):
+            cli.adopt("foo", user=True, category="existing-skill/nested")
+
+        self.assertTrue(runtime_skill.is_dir())
+        self.assertFalse(runtime_skill.is_symlink())
+        self.assertFalse((boundary / "nested" / "foo").exists())
+
     def test_adopt_rejects_skill_name_path_escape(self):
         self.make_runtime_skill("foo")
         with self.assertRaises(cli.LibrarianError):
@@ -220,6 +235,35 @@ class AdoptTests(unittest.TestCase):
         runtime_skill = self.make_runtime_skill("foo")
 
         with mock.patch.object(cli, "make_link", side_effect=OSError("simulated link failure")):
+            with self.assertRaises(cli.LibrarianError):
+                cli.adopt("foo", user=True)
+
+        self.assertTrue(runtime_skill.is_dir())
+        self.assertFalse(runtime_skill.is_symlink())
+        self.assertEqual((runtime_skill / "payload.txt").read_text(), "payload")
+        self.assertFalse((self.library / "imported" / "foo").exists())
+        backups = list(self.codex_user.glob(".skill-librarian-adopt-backup-*"))
+        self.assertEqual(backups, [])
+
+    def test_adopt_rolls_back_when_final_verification_fails(self):
+        runtime_skill = self.make_runtime_skill("foo")
+        real_describe = cli.describe_entry
+        foo_calls = 0
+
+        def describe_with_failed_final_verification(entry, known_sources):
+            nonlocal foo_calls
+            result = real_describe(entry, known_sources)
+            if Path(entry).name == "foo":
+                foo_calls += 1
+                if foo_calls >= 2:
+                    return cli.STATUS_UNMANAGED, result[1]
+            return result
+
+        with mock.patch.object(
+            cli,
+            "describe_entry",
+            side_effect=describe_with_failed_final_verification,
+        ):
             with self.assertRaises(cli.LibrarianError):
                 cli.adopt("foo", user=True)
 
