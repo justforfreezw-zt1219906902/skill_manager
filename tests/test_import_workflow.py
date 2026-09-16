@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -13,10 +14,12 @@ IMPORT_PATH = ROOT / "skill-librarian" / "scripts" / "skill_import.py"
 
 control_spec = importlib.util.spec_from_file_location("skill_librarian_import_control", CONTROL_PATH)
 control = importlib.util.module_from_spec(control_spec)
+sys.modules[control_spec.name] = control
 control_spec.loader.exec_module(control)
 
 import_spec = importlib.util.spec_from_file_location("skill_import_workflow", IMPORT_PATH)
 import_mod = importlib.util.module_from_spec(import_spec)
+sys.modules[import_spec.name] = import_mod
 import_spec.loader.exec_module(import_mod)
 
 
@@ -79,6 +82,17 @@ class ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["skill"], "foo")
         self.assertEqual(metadata["acquired_via"], "local")
         self.assertEqual(control.discover_skills()[0]["foo"], destination.resolve())
+
+    def test_unified_cli_dispatches_import_without_runtime_mount(self):
+        source_root, _ = self.make_source_skill()
+
+        rc = control.main(["import", str(source_root), "--skill", "foo"])
+        self.assertEqual(rc, 0)
+
+        destination = self.library / "imported" / "foo"
+        self.assertTrue(destination.is_dir())
+        self.assertTrue((destination / ".skill-source.json").is_file())
+        self.assertFalse((self.root / "codex-user-skills" / "foo").exists())
 
     def test_import_dry_run_does_not_write(self):
         source_root, _ = self.make_source_skill()
@@ -192,6 +206,7 @@ class ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["source_path"], "skills/foo")
         self.assertFalse(metadata["dirty"])
         self.assertEqual(metadata["acquired_via"], "git")
+        self.assertIsNone(metadata["source"])
 
 
 if __name__ == "__main__":
