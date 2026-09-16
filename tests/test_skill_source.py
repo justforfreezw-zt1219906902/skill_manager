@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -98,7 +97,7 @@ class SkillSourceTests(unittest.TestCase):
         self.assertNotIn("token", json.dumps(metadata))
         self.assertNotIn("secret=1", json.dumps(metadata))
 
-    def test_remote_file_git_source_clones_and_records_exact_revision(self):
+    def test_remote_file_git_source_clones_without_persisting_machine_path(self):
         repo = self.root / "remote-repo"
         self.init_repo(repo)
         skill = self.make_skill(repo, "foo", folder="skills/foo")
@@ -117,11 +116,12 @@ class SkillSourceTests(unittest.TestCase):
             )
 
         self.assertEqual(metadata["type"], "git")
-        self.assertEqual(metadata["source"], source)
+        self.assertIsNone(metadata["source"])
         self.assertEqual(metadata["source_path"], "skills/foo")
         self.assertEqual(metadata["revision"], revision)
         self.assertFalse(metadata["dirty"])
         self.assertEqual(metadata["acquired_via"], "git")
+        self.assertNotIn(str(repo.resolve()), json.dumps(metadata))
 
     def test_remote_ref_checkout_uses_requested_revision(self):
         repo = self.root / "remote-ref"
@@ -178,6 +178,24 @@ class SkillSourceTests(unittest.TestCase):
                 "https://github.com/acme/skills/tree/main/skills/foo",
                 ref="other",
             )
+
+    def test_hinted_skill_must_match_requested_frontmatter_name(self):
+        source_root = self.root / "hinted"
+        wrong = self.make_skill(source_root, "bar", folder="skills/bar")
+        acquired = source_mod.AcquiredSource(
+            root=source_root.resolve(),
+            requested_source="example",
+            source_type="git",
+            recorded_source="https://github.com/acme/skills.git",
+            requested_ref="main",
+            revision="abc",
+            dirty=False,
+            acquired_via="git",
+            path_hint=Path("skills/bar"),
+        )
+        self.assertTrue((wrong / "SKILL.md").is_file())
+        with self.assertRaises(source_mod.SourceError):
+            source_mod.find_skill(acquired, "foo")
 
     def test_write_provenance_is_stable_json(self):
         skill = self.root / "skill"
