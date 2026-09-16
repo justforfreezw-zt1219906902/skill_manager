@@ -1,0 +1,10 @@
+interface:
+  display_name: Skill Librarian
+  short_description: Manage Git-backed skill libraries across Codex and Claude Code runtimes.
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

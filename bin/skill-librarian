@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Command-line entrypoint for skill-librarian."""
+from pathlib import Path
+import runpy
+import sys
+
+repo_root = Path(__file__).resolve().parents[1]
+script = repo_root / "skill-librarian" / "scripts" / "skill_librarian.py"
+sys.argv[0] = str(script)
+runpy.run_path(str(script), run_name="__main__")

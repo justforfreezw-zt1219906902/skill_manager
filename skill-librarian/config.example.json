@@ -1,4 +1,5 @@
 {
-  "skill_library_path": "/Users/<username>/source/skill-library",
+  "skill_library_path": "/Users/<username>/source/personal-agent-skills",
+  "ignored_directories": ["retire_skills"],
   "state_root": "/Users/<username>/.local/state/skills"
 }
