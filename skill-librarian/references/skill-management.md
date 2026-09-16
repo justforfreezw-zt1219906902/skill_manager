@@ -1,6 +1,6 @@
 # Skill management commands
 
-Use the bundled CLI at `scripts/skill_librarian.py` for all mount operations. The source skill library is the source of truth; runtime directories are link-only deployment views.
+Use the bundled CLI at `scripts/skill_librarian.py` for runtime mount, inspection, and adoption operations. The source skill library is the source of truth; runtime directories are link-only deployment views once a skill is managed.
 
 ## Commands
 
@@ -12,6 +12,8 @@ python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --project /absolute
 python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --agent claude-code
 python "$SKILL_DIR/scripts/skill_librarian.py" mount <skill> --agent all
 python "$SKILL_DIR/scripts/skill_librarian.py" unmount <skill>
+python "$SKILL_DIR/scripts/skill_librarian.py" adopt <skill> --user --agent codex
+python "$SKILL_DIR/scripts/skill_librarian.py" adopt <skill> --project /absolute/path/to/repo --agent claude-code
 python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all
 python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all --json
 python "$SKILL_DIR/scripts/skill_librarian.py" doctor --agent all
@@ -27,6 +29,8 @@ Built-in runtimes:
 | `claude-code` | `~/.claude/skills` | `<repo>/.claude/skills` |
 
 Codex is the default when `--agent` is omitted. `--agent` is repeatable, and `--agent all` selects every enabled runtime. `claude` is accepted as an alias for `claude-code`.
+
+`adopt` is the exception: it intentionally accepts exactly one runtime because it takes ownership of one concrete runtime entry. Do not use `--agent all` with `adopt` when multiple runtimes are enabled.
 
 Optional runtime overrides live in `deploy.json`:
 
@@ -53,7 +57,9 @@ Selected runtime/scope targets must resolve to distinct physical directories. If
 
 - `mount <skill>` defaults to the current Git repository and Codex runtime.
 - `mount <skill> --user` defaults to Codex user scope.
-- `--project REPO` always resolves the Git root before mounting.
+- `adopt <skill>` also defaults to the current Git repository and Codex runtime.
+- `adopt <skill> --user` takes ownership of one Codex user-scope runtime entry unless another single runtime is selected explicitly.
+- `--project REPO` always resolves the Git root before mounting or adopting.
 - `list` and `doctor` with no scope inspect user scope plus the current Git repo when available.
 - Source grouping folders never appear in the runtime mount path.
 - The same skill may be mounted into different runtimes; that is expected.
@@ -73,6 +79,9 @@ Example:
 
 ```text
 personal-agent-skills/
+├── imported/
+│   └── adopted-skill/
+│       └── SKILL.md
 ├── 3d_reconstruction_skills/
 │   └── reconstruction-geometry/
 │       └── SKILL.md
@@ -81,7 +90,7 @@ personal-agent-skills/
         └── SKILL.md
 ```
 
-`reconstruction-geometry` is discovered. `agent-state` is not, because `retire_skills` is ignored by default.
+`adopted-skill` and `reconstruction-geometry` are discovered. `agent-state` is not, because `retire_skills` is ignored by default.
 
 Hidden directories are always skipped. Grouping-directory symlinks are not traversed. A symlink that directly represents a skill directory containing `SKILL.md` remains supported for backward compatibility.
 
@@ -125,13 +134,88 @@ If two active source paths provide the same skill basename, the first configured
 }
 ```
 
-A skill installed directly by Codex, Claude Code, `npx skills`, or another tool is `UNMANAGED` until a future adoption workflow deliberately moves it into the canonical library.
+A skill installed directly by Codex, Claude Code, `npx skills`, or another tool is `UNMANAGED` until it is explicitly adopted or removed. Never silently reinterpret an unmanaged runtime directory as canonical source.
+
+## Adopt unmanaged entries
+
+`adopt` is the explicit transition from unmanaged runtime state to a canonical library asset plus a managed runtime link.
+
+Typical user-scope command:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt downloaded-skill --user --agent codex
+```
+
+The default canonical destination is:
+
+```text
+<configured-library>/imported/downloaded-skill/
+```
+
+Choose a durable category when appropriate:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt postgres-review --user --category database_skills
+```
+
+If more than one external canonical library is configured, select one explicitly:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt postgres-review --user --library /absolute/path/to/personal-agent-skills
+```
+
+Preview first when useful:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt downloaded-skill --user --dry-run
+```
+
+Adoption preconditions:
+
+- the runtime entry must exist and classify as exactly `UNMANAGED`;
+- the skill argument must be a simple basename, not a path;
+- no active canonical skill with that basename may already exist;
+- the destination library must be a configured external canonical library, never the `skill_manager` framework root;
+- the destination category must be relative, non-hidden, non-ignored, and stay inside the library;
+- `SKILL.md` must exist and its frontmatter `name` must equal the runtime basename;
+- the canonical library and selected runtime target must not overlap.
+
+Portability validation intentionally rejects:
+
+- broken links inside the skill tree;
+- internal links that resolve outside the skill tree;
+- absolute internal symlinks, even if they currently point back into the source tree, because copying them would preserve the old absolute path;
+- junction/reparse-point dependencies inside the skill tree.
+
+The mutation sequence is transactional at the filesystem level as far as practical:
+
+```text
+UNMANAGED runtime entry
+        |
+        +--> copy to hidden staging dir inside canonical library
+        +--> validate staged copy
+        +--> move staged copy to final canonical destination
+        +--> move original runtime entry to temporary backup
+        +--> create managed runtime link to canonical destination
+        +--> remove backup
+        +--> verify final status == MANAGED
+```
+
+If managed-link creation fails, the command attempts to restore the original runtime entry and remove the newly created canonical destination. A rollback failure is reported explicitly rather than hidden.
+
+When the unmanaged runtime entry is itself an external symlink, the target contents are copied into the canonical library, the runtime link is replaced with the managed link, and the external source target is left untouched.
 
 ## Safety rules
 
 - Mounts are symlinks on macOS/Linux and directory junctions on Windows.
 - `unmount` only removes a link/junction; it refuses to delete a real file or directory.
 - `mount` refuses to overwrite an unmanaged real path.
+- `adopt` is the only first-class command that intentionally takes ownership of an unmanaged runtime entry, and it does so only after validation and staging.
+- `adopt` never overwrites an existing canonical skill/destination and never adopts into an ignored/retired category.
 - Multi-runtime mount/unmount operations preflight every selected target before mutation.
 - If a link exists but points at the wrong active source, use `mount <skill> ... --force` only after confirming that repair is intended.
 - A skill below an ignored directory cannot be mounted through `mount` because it is absent from active discovery.
@@ -144,6 +228,7 @@ A skill installed directly by Codex, Claude Code, `npx skills`, or another tool 
 ```text
 personal-agent-skills Git repo             source of truth
         |
+        +-- imported/                      default home for adopted skills
         +-- active category folders        recursively discovered
         +-- retire_skills/                 ignored
         |
@@ -158,4 +243,4 @@ personal-agent-skills Git repo             source of truth
                        +--> <repo>/.claude/skills/
 ```
 
-Keep edits in the source library. Never edit mounted copies as though they were independent files.
+Keep edits in the source library. Never edit managed runtime links as though they were independent sources. Use `adopt` for explicit unmanaged-to-managed ownership transitions.

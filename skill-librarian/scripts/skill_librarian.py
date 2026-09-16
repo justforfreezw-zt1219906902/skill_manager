@@ -15,14 +15,16 @@ Scoped commands:
     skill-librarian available
     skill-librarian mount NAME [--user | --project REPO] [-a RUNTIME]
     skill-librarian unmount NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian adopt NAME [--user | --project REPO] [-a RUNTIME]
     skill-librarian list [--user | --project REPO] [-a RUNTIME] [--json]
     skill-librarian doctor [--user | --project REPO] [-a RUNTIME]
 
 Runtime defaults preserve the v0.2 behavior: scoped commands target Codex unless
 --agent is supplied. Repeat --agent to target more than one runtime, or use
---agent all. Built-in adapters are codex and claude-code.
+--agent all. Built-in adapters are codex and claude-code. adopt is intentionally
+single-runtime because it takes ownership of one concrete runtime entry.
 
-For mount/unmount, omitting a scope means the current Git repository.
+For mount/unmount/adopt, omitting a scope means the current Git repository.
 For list/doctor, omitting a scope inspects user scope plus the current Git
 repository when one is available.
 
@@ -42,6 +44,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -50,7 +54,8 @@ FRAMEWORK_ROOT = SKILL_DIR.parent
 DEFAULT_TARGETS = ["~/.claude/skills", "~/.agents/skills"]
 DEFAULT_IGNORED_DIRECTORIES = ("retire_skills",)
 DEFAULT_RUNTIME = "codex"
-SCOPED_COMMANDS = {"mount", "unmount", "list", "available", "doctor"}
+DEFAULT_ADOPT_CATEGORY = "imported"
+SCOPED_COMMANDS = {"mount", "unmount", "adopt", "list", "available", "doctor"}
 
 STATUS_MANAGED = "MANAGED"
 STATUS_UNMANAGED = "UNMANAGED"
@@ -434,6 +439,19 @@ def remove_link(path):
         path.unlink()
 
 
+def remove_any_path(path):
+    """Remove one path without following links. Used only for adopt-owned temp/backup paths."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or link_target(path) is not None:
+        remove_link(path)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
 def make_link(src, link):
     src = Path(src).resolve()
     link = Path(link)
@@ -731,6 +749,306 @@ def parse_frontmatter_name(skill_md):
     return None
 
 
+def validate_adopt_skill_name(skill):
+    """Require one simple runtime basename so adopt cannot traverse outside its scope."""
+    if not isinstance(skill, str) or not skill.strip():
+        raise LibrarianError("adopt skill name must be a non-empty basename")
+    if skill != skill.strip() or skill in {".", ".."} or skill.startswith("."):
+        raise LibrarianError(f"Invalid adopt skill name: {skill!r}")
+    if "/" in skill or "\\" in skill or Path(skill).name != skill:
+        raise LibrarianError(f"adopt skill name must be a basename, not a path: {skill!r}")
+    return skill
+
+
+def configured_adopt_libraries():
+    """Return configured canonical libraries excluding the framework repo itself."""
+    framework = FRAMEWORK_ROOT.resolve(strict=False)
+    return [
+        root
+        for root in configured_library_roots(include_missing=True)
+        if root.resolve(strict=False) != framework
+    ]
+
+
+def resolve_adopt_library(raw=None):
+    """Choose one configured, existing canonical library for an adopt operation."""
+    candidates = configured_adopt_libraries()
+    if raw:
+        selected = absolute_config_path(raw, "--library")
+        if selected not in candidates:
+            configured = ", ".join(short(p) for p in candidates) or "(none)"
+            raise LibrarianError(
+                f"--library must be one of the configured canonical libraries: {configured}"
+            )
+    else:
+        existing = [path for path in candidates if path.is_dir()]
+        if not existing:
+            raise LibrarianError(
+                "No external canonical skill library is configured. Add one to deploy.json libraries "
+                "or skill_library_path before adopting."
+            )
+        if len(existing) > 1:
+            choices = ", ".join(short(p) for p in existing)
+            raise LibrarianError(
+                f"Multiple canonical libraries are configured ({choices}); choose one with --library."
+            )
+        selected = existing[0]
+
+    if not selected.is_dir():
+        raise LibrarianError(f"Adopt library does not exist: {short(selected)}")
+    return selected.resolve()
+
+
+def adopt_category_path(category):
+    if not isinstance(category, str) or not category.strip():
+        raise LibrarianError("--category must be a non-empty relative path")
+    candidate = Path(category.strip())
+    if candidate.is_absolute() or candidate == Path(".") or any(part == ".." for part in candidate.parts):
+        raise LibrarianError("--category must stay inside the canonical library")
+    ignored = ignored_directory_names()
+    for part in candidate.parts:
+        if part.startswith("."):
+            raise LibrarianError("--category cannot use hidden directories")
+        if part in ignored:
+            raise LibrarianError(f"--category cannot use ignored directory '{part}'")
+    return candidate
+
+
+def ensure_inside_root(path, root, label):
+    root = Path(root).resolve(strict=False)
+    resolved = Path(path).resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise LibrarianError(f"{label} escapes canonical library {short(root)}: {short(resolved)}") from exc
+    return resolved
+
+
+def paths_overlap(a, b):
+    a = Path(a).resolve(strict=False)
+    b = Path(b).resolve(strict=False)
+    try:
+        a.relative_to(b)
+        return True
+    except ValueError:
+        pass
+    try:
+        b.relative_to(a)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_adopt_category_ancestry(library_root, category_path):
+    """Ensure the category is a discoverable grouping path, not inside a skill boundary/link."""
+    current = Path(library_root).resolve(strict=False)
+    for part in category_path.parts:
+        current = current / part
+        if not os.path.lexists(current):
+            continue
+        if current.is_symlink() or link_target(current) is not None:
+            raise LibrarianError(
+                f"Adopt category cannot traverse a symlink/junction: {short(current)}"
+            )
+        if not current.is_dir():
+            raise LibrarianError(f"Adopt category component is not a directory: {short(current)}")
+        if (current / "SKILL.md").is_file():
+            raise LibrarianError(
+                f"Adopt category is inside existing skill boundary: {short(current)}"
+            )
+
+
+def validate_adopt_skill_tree(source, skill):
+    source = Path(source)
+    if not source.is_dir():
+        raise LibrarianError(f"Adopt source is not a directory: {short(source)}")
+    manifest = source / "SKILL.md"
+    if not manifest.is_file():
+        raise LibrarianError(f"Adopt source has no SKILL.md: {short(source)}")
+    fm_name = parse_frontmatter_name(manifest)
+    if fm_name is None:
+        raise LibrarianError(f"{short(manifest)} has no readable 'name' frontmatter")
+    if fm_name != skill:
+        raise LibrarianError(
+            f"Cannot adopt '{skill}': SKILL.md frontmatter name is '{fm_name}'"
+        )
+
+    source_root = source.resolve()
+    for current, dirnames, filenames in os.walk(source, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            child = Path(current) / name
+            linked_target = link_target(child)
+            if child.is_symlink():
+                try:
+                    raw_target = os.readlink(child)
+                except OSError as exc:
+                    raise LibrarianError(f"Cannot inspect internal link {short(child)}: {exc}") from exc
+                if Path(raw_target).is_absolute():
+                    raise LibrarianError(
+                        f"Cannot adopt absolute internal link: {short(child)} -> {raw_target}"
+                    )
+            elif linked_target is not None:
+                # Junctions/reparse points preserve machine-local absolute targets when copied.
+                raise LibrarianError(
+                    f"Cannot adopt non-portable junction/reparse point inside skill tree: {short(child)}"
+                )
+            else:
+                continue
+
+            if not child.exists():
+                raise LibrarianError(f"Cannot adopt broken internal link: {short(child)}")
+            target = child.resolve(strict=False)
+            try:
+                target.relative_to(source_root)
+            except ValueError as exc:
+                raise LibrarianError(
+                    f"Cannot adopt non-portable link outside the skill tree: {short(child)} -> {short(target)}"
+                ) from exc
+    return manifest
+
+
+def adopt(
+    skill,
+    user=False,
+    project=None,
+    agents=None,
+    library=None,
+    category=DEFAULT_ADOPT_CATEGORY,
+    dry_run=False,
+):
+    """Take ownership of one UNMANAGED runtime skill and replace it with a managed link."""
+    validate_adopt_skill_name(skill)
+    adapters = runtime_adapters(agents)
+    if len(adapters) != 1:
+        names = ", ".join(adapter.name for adapter in adapters)
+        raise LibrarianError(
+            f"adopt requires exactly one runtime; selected: {names or '(none)'}"
+        )
+    adapter = adapters[0]
+    scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+    runtime_entry = target_dir / skill
+
+    skills, _ = discover_skills()
+    if not os.path.lexists(runtime_entry):
+        raise LibrarianError(
+            f"No runtime entry named '{skill}' at {short(runtime_entry)}"
+        )
+
+    status, resolved = describe_entry(runtime_entry, skills)
+    if status != STATUS_UNMANAGED:
+        raise LibrarianError(
+            f"adopt only accepts UNMANAGED entries; {short(runtime_entry)} is {status}"
+        )
+    if skill in skills:
+        raise LibrarianError(
+            f"Canonical skill '{skill}' already exists at {short(skills[skill])}; refusing to create a duplicate"
+        )
+
+    external_link = link_target(runtime_entry)
+    source = external_link if external_link is not None else runtime_entry.resolve()
+    validate_adopt_skill_tree(source, skill)
+
+    library_root = resolve_adopt_library(library)
+    category_path = adopt_category_path(category)
+    validate_adopt_category_ancestry(library_root, category_path)
+    destination = library_root / category_path / skill
+    ensure_inside_root(destination, library_root, "Adopt destination")
+
+    if os.path.lexists(destination):
+        raise LibrarianError(f"Adopt destination already exists: {short(destination)}")
+    if paths_overlap(library_root, target_dir):
+        raise LibrarianError(
+            f"Canonical library and runtime target must not overlap: {short(library_root)} vs {short(target_dir)}"
+        )
+
+    label = f"{adapter.name}:{scope}"
+    if dry_run:
+        source_kind = "external link target" if external_link is not None else "runtime directory"
+        print(f"ADOPT    {skill} [{label}]")
+        print(f"  source ({source_kind}): {short(source)}")
+        print(f"  canonical:              {short(destination)}")
+        print(f"  runtime after adopt:    {short(runtime_entry)} -> {short(destination)}")
+        return 0
+
+    stage_root = Path(
+        tempfile.mkdtemp(prefix=f".skill-librarian-adopt-{skill}-", dir=str(library_root))
+    )
+    staged_skill = stage_root / skill
+    backup = target_dir / f".skill-librarian-adopt-backup-{skill}-{uuid.uuid4().hex}"
+    destination_created = False
+    runtime_moved = False
+
+    try:
+        shutil.copytree(source, staged_skill, symlinks=True)
+        validate_adopt_skill_tree(staged_skill, skill)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        ensure_inside_root(destination, library_root, "Adopt destination")
+        if os.path.lexists(destination):
+            raise LibrarianError(f"Adopt destination appeared during staging: {short(destination)}")
+
+        os.replace(staged_skill, destination)
+        destination_created = True
+
+        discovered_after_copy, _ = discover_skills()
+        if discovered_after_copy.get(skill) != destination.resolve():
+            raise LibrarianError(
+                f"Adopt destination is not discoverable as canonical skill '{skill}': {short(destination)}"
+            )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(backup):
+            raise LibrarianError(f"Unexpected adopt backup collision: {short(backup)}")
+        os.replace(runtime_entry, backup)
+        runtime_moved = True
+
+        make_link(destination, runtime_entry)
+
+        adopted_skills, _ = discover_skills()
+        final_status, final_target = describe_entry(runtime_entry, adopted_skills)
+        if final_status != STATUS_MANAGED or final_target != destination.resolve():
+            raise LibrarianError(
+                f"Adopt final verification failed: {short(runtime_entry)} is {final_status}"
+            )
+    except Exception as exc:
+        rollback_errors = []
+        try:
+            if os.path.lexists(runtime_entry):
+                remove_any_path(runtime_entry)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"remove replacement: {rollback_exc}")
+        try:
+            if runtime_moved and os.path.lexists(backup):
+                os.replace(backup, runtime_entry)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"restore runtime entry: {rollback_exc}")
+        try:
+            if destination_created and os.path.lexists(destination):
+                remove_any_path(destination)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"remove canonical copy: {rollback_exc}")
+
+        detail = f"Adopt failed for '{skill}': {exc}"
+        if rollback_errors:
+            detail += "; rollback problems: " + "; ".join(rollback_errors)
+        raise LibrarianError(detail) from exc
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+    try:
+        remove_any_path(backup)
+    except Exception as cleanup_exc:
+        print(
+            f"WARNING: adopted '{skill}' but could not remove backup {short(backup)}: {cleanup_exc}",
+            file=sys.stderr,
+        )
+
+    print(f"ADOPTED  {skill} [{label}] {short(runtime_entry)} -> {short(destination)}")
+    if external_link is not None:
+        print(f"PRESERVED external source: {short(source)}")
+    return 0
+
+
 def git_tracked(project_root, path):
     try:
         lexical = Path(os.path.abspath(path))
@@ -1006,6 +1324,32 @@ def scoped_main(argv):
             project=a.project,
             dry_run=a.dry_run,
             agents=a.agents,
+        )
+    )
+
+    p_adopt = subs.add_parser("adopt", help="adopt one unmanaged runtime skill into a canonical library")
+    p_adopt.add_argument("skill")
+    add_scope_args(p_adopt)
+    p_adopt.add_argument(
+        "--library",
+        metavar="PATH",
+        help="configured canonical library root; required when more than one external library exists",
+    )
+    p_adopt.add_argument(
+        "--category",
+        default=DEFAULT_ADOPT_CATEGORY,
+        help=f"relative category inside the canonical library (default: {DEFAULT_ADOPT_CATEGORY})",
+    )
+    p_adopt.add_argument("--dry-run", action="store_true")
+    p_adopt.set_defaults(
+        handler=lambda a: adopt(
+            a.skill,
+            user=a.user,
+            project=a.project,
+            agents=a.agents,
+            library=a.library,
+            category=a.category,
+            dry_run=a.dry_run,
         )
     )
 

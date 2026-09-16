@@ -101,7 +101,7 @@ python3 skill-librarian/scripts/skill_librarian.py list
 python3 skill-librarian/scripts/skill_librarian.py doctor
 ```
 
-For compatibility with v0.2, scoped commands target **Codex by default**. Select another runtime with `--agent` / `-a`, repeat it for multiple runtimes, or use `--agent all`.
+For compatibility with v0.2, scoped commands target **Codex by default**. Select another runtime with `--agent` / `-a`, repeat it for multiple runtimes, or use `--agent all`. `adopt` is intentionally single-runtime because it takes ownership of one concrete runtime entry.
 
 ### Mount to a project
 
@@ -172,6 +172,60 @@ python3 skill-librarian/scripts/skill_librarian.py \
 
 `unmount` removes links/junctions only. It refuses to delete a real directory or file. Multi-runtime mount/unmount operations preflight targets first so a blocked runtime does not silently leave a partial operation.
 
+## Adopt unmanaged runtime skills
+
+Use `adopt` when Codex, Claude Code, `npx skills`, or another tool has placed a skill directly in a runtime directory and `list`/`doctor` reports it as `UNMANAGED`.
+
+Codex user scope:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  adopt downloaded-skill --user --agent codex
+```
+
+Project scope:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  adopt downloaded-skill --project /path/to/repo --agent claude-code
+```
+
+The default destination category is `imported/` inside the canonical library:
+
+```text
+personal-agent-skills/
+└── imported/
+    └── downloaded-skill/
+        └── SKILL.md
+```
+
+Choose another category when the skill already has a durable classification:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  adopt postgres-review --user --category database_skills
+```
+
+If more than one external canonical library is configured, choose one explicitly:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  adopt postgres-review --user --library /absolute/path/to/personal-agent-skills
+```
+
+Preview without changing anything:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  adopt downloaded-skill --user --dry-run
+```
+
+`adopt` accepts exactly one runtime entry and only when its current status is `UNMANAGED`. It validates the runtime basename, `SKILL.md` name, destination category, configured library ownership, and internal links before mutating anything. The copy is staged and revalidated first; only then is the unmanaged runtime entry replaced with a managed link. If creating the managed link fails, the original runtime entry and canonical destination are rolled back.
+
+If the unmanaged runtime entry is itself a symlink to an external skill source, `adopt` copies that source into the canonical library, replaces only the runtime link, and leaves the external source untouched.
+
+For portability, the first version of `adopt` refuses broken/external internal links, absolute internal symlinks, and junction/reparse-point dependencies inside the skill tree. Clean or vendor those dependencies before adopting.
+
 ## Runtime inspection and unmanaged detection
 
 `list` reports the runtime, scope, skill name, status, and resolved target:
@@ -206,7 +260,7 @@ Current status values are:
 - `RETIRED` - the runtime still points into an ignored/retired source subtree.
 - `MISSING_SOURCE` - the runtime link points into a managed library location whose source no longer exists.
 
-This is intentionally strict: a skill installed directly by Codex, Claude Code, `npx skills`, or another tool is **unmanaged** until a future `adopt` workflow brings it into the canonical library.
+This is intentionally strict: a skill installed directly by Codex, Claude Code, `npx skills`, or another tool remains **unmanaged** until you explicitly run `adopt` or remove it.
 
 ## Doctor
 
@@ -231,6 +285,10 @@ The same skill mounted into Codex and Claude Code is expected and is **not** tre
 - The source library is never modified by `mount` or `unmount`.
 - `mount` refuses to replace unmanaged real directories/files.
 - `unmount` refuses to delete unmanaged real directories/files.
+- `adopt` is the explicit ownership transition from `UNMANAGED` runtime state to a canonical source plus managed runtime link.
+- `adopt` never overwrites an existing canonical skill or destination.
+- `adopt` requires a configured external canonical library and never adopts into the `skill_manager` framework root.
+- `adopt` rejects runtime path traversal, hidden/ignored destination categories, and non-portable internal links.
 - An existing wrong link is repaired only with `--force`.
 - Skills below ignored directories such as `retire_skills` are not available for mounting.
 - `doctor` fails when a runtime still points into an ignored/retired source subtree.
@@ -247,7 +305,7 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill NAME
 ```
 
-Legacy deployment still uses the `targets` array and the same recursive source discovery/ignore rules. New workflows should use scoped `mount` / `unmount` commands and runtime adapters instead.
+Legacy deployment still uses the `targets` array and the same recursive source discovery/ignore rules. New workflows should use scoped `mount`, `unmount`, and `adopt` commands plus runtime adapters instead.
 
 ## Recommended ownership
 
@@ -255,6 +313,7 @@ For a personal setup:
 
 ```text
 personal-agent-skills/                     # Git source of truth
+├── imported/                              # default home for adopted skills
 ├── 3d_reconstruction_skills/
 │   └── reconstruction-geometry/
 └── retire_skills/                         # ignored by discovery
@@ -271,9 +330,8 @@ That keeps **what the skill is** in Git while runtime directories express only *
 
 ## Roadmap
 
-The runtime adapter layer and unmanaged detection are the foundation for the next lifecycle commands:
-
 ```text
+v0.3  runtime adapters + unmanaged detection
 v0.4  adopt unmanaged runtime skills into the canonical library
 v0.5  import external skills + provenance metadata
 v0.6  upstream diff / update

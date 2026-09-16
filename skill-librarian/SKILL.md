@@ -1,6 +1,6 @@
 ---
 name: skill-librarian
-description: Manage a Git-backed central agent-skill library and deploy skills safely across Codex and Claude Code runtime scopes. Use when the user wants to add/migrate a skill into the library, organize or retire skills, list available skills, mount/unmount at user or project scope, inspect runtime state, detect unmanaged skills, repair links, or diagnose skill-library problems. Supports recursive grouped source libraries, ignored retirement folders, Codex and Claude Code runtime adapters, strict runtime status classification, and JSON inspection while keeping the central library authoritative.
+description: Manage a Git-backed central agent-skill library and deploy skills safely across Codex and Claude Code runtime scopes. Use when the user wants to add/migrate or adopt a skill into the library, organize or retire skills, list available skills, mount/unmount at user or project scope, inspect runtime state, detect unmanaged skills, repair links, or diagnose skill-library problems. Supports recursive grouped source libraries, ignored retirement folders, Codex and Claude Code runtime adapters, strict runtime status classification, safe unmanaged-to-managed adoption, and JSON inspection while keeping the central library authoritative.
 ---
 
 # Skill Librarian
@@ -104,7 +104,7 @@ Use absolute paths in machine config. Never put secrets in committed files.
 
 ## Skill management
 
-Use the bundled deterministic CLI for link management. Do not hand-write `ln -s` when the CLI is available.
+Use the bundled deterministic CLI for link management and ownership transitions. Do not hand-write `ln -s` when the CLI is available.
 
 Set:
 
@@ -120,7 +120,7 @@ python "$SKILL_DIR/scripts/skill_librarian.py" list --agent all
 python "$SKILL_DIR/scripts/skill_librarian.py" doctor --agent all
 ```
 
-Codex is the default runtime for compatibility. Use `--agent codex`, `--agent claude-code`, repeat `--agent`, or use `--agent all`.
+Codex is the default runtime for compatibility. Use `--agent codex`, `--agent claude-code`, repeat `--agent`, or use `--agent all`. `adopt` is intentionally single-runtime because it takes ownership of one concrete runtime entry.
 
 ### Mount a project skill
 
@@ -164,6 +164,53 @@ python "$SKILL_DIR/scripts/skill_librarian.py" \
 
 `unmount` removes links/junctions only. If the target is a real directory or file, stop and report it; never delete it automatically.
 
+### Adopt an unmanaged runtime skill
+
+Use `adopt` only when runtime inspection reports the entry as `UNMANAGED` and the user wants that skill to become a canonical library asset.
+
+Codex user scope:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt <skill> --user --agent codex
+```
+
+Project scope:
+
+```bash
+python "$SKILL_DIR/scripts/skill_librarian.py" \
+  adopt <skill> --project /path/to/repo --agent claude-code
+```
+
+The default canonical category is `imported/`. Use `--category <relative-category>` for a known durable classification. If multiple external canonical libraries are configured, select one with `--library /absolute/path/to/library`. Use `--dry-run` before mutation when the source or destination is unfamiliar.
+
+Adopt is a controlled ownership transition:
+
+```text
+UNMANAGED runtime directory/link
+        |
+        +--> stage + validate copy
+        |
+        +--> canonical library/<category>/<skill>
+        |
+        +--> runtime entry replaced by managed link
+        |
+        +--> verify MANAGED
+```
+
+Required safety behavior:
+
+- accept exactly one runtime and one runtime entry;
+- validate the skill argument as a simple basename, never a path;
+- require a readable `SKILL.md` whose `name` matches the runtime basename;
+- adopt only into a configured external canonical library, never the skill_manager framework root;
+- refuse existing canonical skill-name or destination collisions;
+- refuse hidden/ignored/escaping destination categories;
+- refuse broken/external internal links, absolute internal symlinks, and junction/reparse-point dependencies that would make the copied skill non-portable;
+- stage and revalidate the copy before touching the runtime entry;
+- roll back the original runtime entry and canonical destination if managed-link creation fails;
+- if the unmanaged runtime entry is itself an external symlink, preserve that external source and replace only the runtime link.
+
 ### Available
 
 ```bash
@@ -188,7 +235,7 @@ Statuses:
 - `RETIRED`: runtime still points into an ignored/retired source subtree.
 - `MISSING_SOURCE`: runtime points into a managed library location whose source disappeared.
 
-A skill installed directly by Codex, Claude Code, `npx skills`, or another tool is intentionally `UNMANAGED` until a deliberate adoption workflow brings it into the canonical library.
+A skill installed directly by Codex, Claude Code, `npx skills`, or another tool is intentionally `UNMANAGED` until the user explicitly adopts or removes it.
 
 ### Doctor
 
@@ -196,7 +243,7 @@ A skill installed directly by Codex, Claude Code, `npx skills`, or another tool 
 python "$SKILL_DIR/scripts/skill_librarian.py" doctor --agent all
 ```
 
-Use it after changing libraries, regrouping skills, retiring skills, moving repos, changing runtime config, or mounting/unmounting skills. It checks for:
+Use it after changing libraries, regrouping skills, retiring skills, moving repos, changing runtime config, mounting/unmounting, or adopting skills. It checks for:
 
 - missing configured libraries;
 - malformed or mismatched `SKILL.md` names;
@@ -208,17 +255,17 @@ Use it after changing libraries, regrouping skills, retiring skills, moving repo
 - the same skill mounted at both user and project scope inside one runtime;
 - project mounts accidentally tracked by Git.
 
-Read `references/skill-management.md` for exact discovery, runtime, status, and safety behavior.
+Read `references/skill-management.md` for exact discovery, runtime, status, adoption, and safety behavior.
 
-## Safety rules for mount management
+## Safety rules for mount and adoption management
 
 - Treat source skill folders as immutable from mount/unmount operations.
 - Never copy a skill merely to deploy it unless symlinks/junctions are impossible and the user explicitly asks for a copy.
-- Never replace an unmanaged real target automatically.
-- Multi-runtime operations must preflight all selected targets before mutation.
+- Never replace an unmanaged real target automatically; use `adopt` only for an explicit ownership transition.
+- Multi-runtime mount/unmount operations must preflight all selected targets before mutation.
 - Reject selected runtime/scope targets that resolve to the same physical directory.
 - Only use `--force` to repair an existing wrong link that points at the wrong active source, after confirming that repair is intended.
-- Do not mount skills from ignored/retired source folders.
+- Do not mount or adopt into ignored/retired source folders.
 - If `doctor` reports a retired link, unmount it explicitly; do not silently relink it elsewhere.
 - Project mounts are normally local machine state because they point to absolute source paths. Do not commit those links unless the project explicitly wants that machine-specific behavior.
 - The same skill may be mounted in Codex and Claude Code. Normally do not mount the same skill at both user and project scope within one runtime.
@@ -233,7 +280,7 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill <name>
 ```
 
-Legacy deployment uses the `targets` array plus the same recursive discovery and ignore rules. Prefer scoped `mount`/`unmount` commands with runtime adapters for new workflows.
+Legacy deployment uses the `targets` array plus the same recursive discovery and ignore rules. Prefer scoped `mount`/`unmount`/`adopt` commands with runtime adapters for new workflows.
 
 ## Migrating or filing a skill into the library
 
@@ -328,7 +375,7 @@ Retirement changes availability only; it does not delete source history.
 
 ## References
 
-- `references/skill-management.md` — recursive discovery, runtime adapters, status classification, mount/unmount/list/available/doctor behavior, and safety rules.
+- `references/skill-management.md` — recursive discovery, runtime adapters, status classification, mount/unmount/adopt/list/available/doctor behavior, and safety rules.
 - `references/case-study-daily-summary.md` — full migration example.
 - `references/migration-recipes.md` — migration patterns for config, paths, state, and vendoring.
 - `references/determinism-audit.md` — deciding when mechanical workflow steps should be compiled into scripts.
