@@ -72,6 +72,12 @@ class SkillLibrarianTests(unittest.TestCase):
         self.framework_patch.stop()
         self.tmp.cleanup()
 
+    def read_cfg(self):
+        return json.loads((self.framework / "deploy.json").read_text())
+
+    def write_cfg(self, cfg):
+        (self.framework / "deploy.json").write_text(json.dumps(cfg))
+
     def test_available_discovers_nested_skill_and_ignores_retired(self):
         skills, clashes = cli.discover_skills()
         self.assertEqual(set(skills), {"reconstruction-geometry", "skill-librarian"})
@@ -92,9 +98,9 @@ class SkillLibrarianTests(unittest.TestCase):
         old = archive / "old-skill"
         old.mkdir()
         (old / "SKILL.md").write_text("---\nname: old-skill\ndescription: test\n---\n")
-        cfg = json.loads((self.framework / "deploy.json").read_text())
+        cfg = self.read_cfg()
         cfg["ignored_directories"] = ["retire_skills", "archive"]
-        (self.framework / "deploy.json").write_text(json.dumps(cfg))
+        self.write_cfg(cfg)
         skills, _ = cli.discover_skills()
         self.assertNotIn("old-skill", skills)
         self.assertNotIn("agent-state", skills)
@@ -152,6 +158,16 @@ class SkillLibrarianTests(unittest.TestCase):
             cli.mount("reconstruction-geometry", user=True, agents=["codex", "claude-code"])
         self.assertFalse(os.path.lexists(self.root / "user-skills" / "reconstruction-geometry"))
         self.assertTrue(blocked.is_dir())
+
+    def test_multi_runtime_target_collision_is_rejected(self):
+        cfg = self.read_cfg()
+        shared = str(self.root / "shared-runtime-skills")
+        cfg["user_target"] = shared
+        cfg["runtimes"]["claude-code"]["user_target"] = shared
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", user=True, agents=["all"])
+        self.assertFalse((self.root / "shared-runtime-skills" / "reconstruction-geometry").exists())
 
     def test_unmount_refuses_unmanaged_real_directory(self):
         target = self.repo / ".agents" / "skills" / "reconstruction-geometry"
@@ -242,11 +258,47 @@ class SkillLibrarianTests(unittest.TestCase):
             )
 
     def test_disabled_runtime_is_rejected_when_selected(self):
-        cfg = json.loads((self.framework / "deploy.json").read_text())
+        cfg = self.read_cfg()
         cfg["runtimes"]["claude-code"]["enabled"] = False
-        (self.framework / "deploy.json").write_text(json.dumps(cfg))
+        self.write_cfg(cfg)
         with self.assertRaises(cli.LibrarianError):
             cli.mount("reconstruction-geometry", user=True, agents=["claude-code"])
+
+    def test_unknown_runtime_config_key_is_rejected(self):
+        cfg = self.read_cfg()
+        cfg["runtimes"]["claude-code"]["user_targte"] = str(self.root / "typo")
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", user=True, agents=["claude-code"])
+
+    def test_relative_user_target_is_rejected(self):
+        cfg = self.read_cfg()
+        cfg["runtimes"]["claude-code"]["user_target"] = "relative/skills"
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", user=True, agents=["claude-code"])
+
+    def test_project_target_cannot_escape_repo(self):
+        cfg = self.read_cfg()
+        cfg["runtimes"]["codex"]["project_target"] = "../outside"
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", project=str(self.repo))
+
+    def test_project_target_cannot_be_repo_root(self):
+        cfg = self.read_cfg()
+        cfg["runtimes"]["codex"]["project_target"] = "."
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", project=str(self.repo))
+
+    def test_agent_all_rejects_when_all_runtimes_disabled(self):
+        cfg = self.read_cfg()
+        cfg["runtimes"]["codex"]["enabled"] = False
+        cfg["runtimes"]["claude-code"]["enabled"] = False
+        self.write_cfg(cfg)
+        with self.assertRaises(cli.LibrarianError):
+            cli.runtime_adapters(["all"])
 
 
 if __name__ == "__main__":
