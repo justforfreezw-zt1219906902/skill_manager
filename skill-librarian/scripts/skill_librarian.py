@@ -59,6 +59,8 @@ STATUS_WRONG_LINK = "WRONG_LINK"
 STATUS_RETIRED = "RETIRED"
 STATUS_MISSING_SOURCE = "MISSING_SOURCE"
 
+RUNTIME_CONFIG_KEYS = {"enabled", "user_target", "project_target"}
+
 
 class LibrarianError(RuntimeError):
     pass
@@ -74,11 +76,7 @@ class RuntimeAdapter:
         self.aliases = tuple(aliases)
 
     def runtime_config(self):
-        runtimes = config().get("runtimes", {})
-        if runtimes is None:
-            return {}
-        if not isinstance(runtimes, dict):
-            raise LibrarianError("runtimes must be a JSON object")
+        runtimes = runtime_config_root()
         raw = runtimes.get(self.name, {})
         if raw is False:
             return {"enabled": False}
@@ -86,6 +84,20 @@ class RuntimeAdapter:
             return {}
         if not isinstance(raw, dict):
             raise LibrarianError(f"runtimes.{self.name} must be a JSON object or boolean")
+
+        unknown = sorted(set(raw) - RUNTIME_CONFIG_KEYS)
+        if unknown:
+            raise LibrarianError(
+                f"runtimes.{self.name} has unknown key(s): {', '.join(unknown)}"
+            )
+        if "enabled" in raw and not isinstance(raw["enabled"], bool):
+            raise LibrarianError(f"runtimes.{self.name}.enabled must be a boolean")
+        if "user_target" in raw:
+            absolute_config_path(raw["user_target"], f"runtimes.{self.name}.user_target")
+        if "project_target" in raw:
+            project_relative_config_path(
+                raw["project_target"], f"runtimes.{self.name}.project_target"
+            )
         return raw
 
     def is_enabled(self):
@@ -95,35 +107,46 @@ class RuntimeAdapter:
         runtime_cfg = self.runtime_config()
         explicit = runtime_cfg.get("user_target")
         if explicit:
-            return Path(os.path.expanduser(explicit)).resolve()
+            return absolute_config_path(explicit, f"runtimes.{self.name}.user_target")
 
         # Backward compatibility: v0.2 used top-level user_target only for Codex.
         if self.name == "codex":
             cfg = config()
             explicit = cfg.get("user_target")
             if explicit:
-                return Path(os.path.expanduser(explicit)).resolve()
+                return absolute_config_path(explicit, "user_target")
             for target in cfg.get("targets", []):
-                expanded = Path(os.path.expanduser(target)).resolve()
+                expanded = absolute_config_path(target, "targets[]")
                 if expanded.as_posix().rstrip("/").endswith("/.agents/skills"):
                     return expanded
 
-        return Path(os.path.expanduser(self.default_user_target)).resolve()
+        return absolute_config_path(self.default_user_target, f"default {self.name} user target")
 
     def project_target(self, path=".", required=True):
         root = git_root(path, required=required)
         if root is None:
             return None
+
         runtime_cfg = self.runtime_config()
         relative = runtime_cfg.get("project_target")
-        if relative:
-            candidate = Path(os.path.expanduser(relative))
-            if candidate.is_absolute():
-                raise LibrarianError(
-                    f"runtimes.{self.name}.project_target must be relative to the Git root"
-                )
-            return root / candidate
-        return root / self.project_relative
+        candidate = (
+            project_relative_config_path(relative, f"runtimes.{self.name}.project_target")
+            if relative
+            else self.project_relative
+        )
+
+        target = (root / candidate).resolve(strict=False)
+        try:
+            relative_target = target.relative_to(root)
+        except ValueError as exc:
+            raise LibrarianError(
+                f"runtimes.{self.name}.project_target resolves outside the Git root: {target}"
+            ) from exc
+        if not relative_target.parts:
+            raise LibrarianError(
+                f"runtimes.{self.name}.project_target must be a subdirectory of the Git root"
+            )
+        return target
 
 
 RUNTIME_ADAPTERS = {
@@ -168,6 +191,38 @@ def local_skill_config():
     return _read_json(SKILL_DIR / "config.json")
 
 
+def runtime_config_root():
+    raw = config().get("runtimes", {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise LibrarianError("runtimes must be a JSON object")
+    unknown = sorted(set(raw) - set(RUNTIME_ADAPTERS))
+    if unknown:
+        raise LibrarianError(f"Unknown runtime configuration key(s): {', '.join(unknown)}")
+    return raw
+
+
+def absolute_config_path(raw, label):
+    if not isinstance(raw, str) or not raw.strip():
+        raise LibrarianError(f"{label} must be a non-empty absolute path string")
+    candidate = Path(os.path.expanduser(raw.strip()))
+    if not candidate.is_absolute():
+        raise LibrarianError(f"{label} must be an absolute path (or start with ~): {raw}")
+    return candidate.resolve(strict=False)
+
+
+def project_relative_config_path(raw, label):
+    if not isinstance(raw, str) or not raw.strip():
+        raise LibrarianError(f"{label} must be a non-empty relative path string")
+    candidate = Path(raw.strip())
+    if candidate.is_absolute():
+        raise LibrarianError(f"{label} must be relative to the Git root")
+    if candidate == Path(".") or any(part == ".." for part in candidate.parts):
+        raise LibrarianError(f"{label} must stay inside a subdirectory of the Git root")
+    return candidate
+
+
 def short(path):
     path = str(path)
     home = str(Path.home())
@@ -194,18 +249,22 @@ def ignored_directory_names():
 
 def configured_library_roots(include_missing=False):
     roots = [FRAMEWORK_ROOT]
-    roots.extend(Path(os.path.expanduser(p)).resolve() for p in config().get("libraries", []))
+    raw_libraries = config().get("libraries", [])
+    if not isinstance(raw_libraries, list):
+        raise LibrarianError("libraries must be a JSON list of absolute path strings")
+    for raw in raw_libraries:
+        roots.append(absolute_config_path(raw, "libraries[]"))
 
     # A standalone/deployed skill may not have the framework-level deploy.json.
     # Reuse its existing migration config as a fallback library declaration.
     library = local_skill_config().get("skill_library_path")
     if library:
-        roots.append(Path(os.path.expanduser(library)).resolve())
+        roots.append(absolute_config_path(library, "skill_library_path"))
 
     seen = set()
     out = []
     for root in roots:
-        root = root.resolve()
+        root = root.resolve(strict=False)
         if root in seen:
             continue
         seen.add(root)
@@ -280,6 +339,10 @@ def normalize_runtime_name(name):
 
 def runtime_adapters(agents=None):
     """Resolve CLI agent selectors to distinct built-in runtime adapters."""
+    # Validate the complete runtime config even if only one adapter is selected so
+    # typos cannot sit silently in deploy.json.
+    runtime_config_root()
+
     requested = list(agents or [DEFAULT_RUNTIME])
     if not requested:
         requested = [DEFAULT_RUNTIME]
@@ -289,6 +352,8 @@ def runtime_adapters(agents=None):
         if len(normalized) > 1:
             raise LibrarianError("--agent all cannot be combined with other --agent values")
         names = [name for name, adapter in RUNTIME_ADAPTERS.items() if adapter.is_enabled()]
+        if not names:
+            raise LibrarianError("--agent all selected no enabled runtimes")
     else:
         names = normalized
 
@@ -317,17 +382,42 @@ def project_target(path="."):
     return RUNTIME_ADAPTERS["codex"].project_target(path)
 
 
+def target_identity(path):
+    """Return a normalized physical identity for target-collision checks."""
+    try:
+        return Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(path))
+
+
+def ensure_distinct_targets(targets):
+    """Reject two selected runtime/scope labels that resolve to the same directory."""
+    seen = {}
+    for runtime, scope, path in targets:
+        identity = target_identity(path)
+        previous = seen.get(identity)
+        if previous is not None and previous != (runtime, scope):
+            prev_runtime, prev_scope = previous
+            raise LibrarianError(
+                "Runtime target collision: "
+                f"{prev_runtime}:{prev_scope} and {runtime}:{scope} both resolve to {short(identity)}"
+            )
+        seen[identity] = (runtime, scope)
+
+
 def link_target(path):
     """Return resolved target for a symlink/junction, otherwise None."""
     path = Path(path)
     if not os.path.lexists(path):
         return None
     if path.is_symlink():
-        return Path(os.path.realpath(path)).resolve()
-    if os.name == "nt" and path.is_dir():
+        return Path(os.path.realpath(path)).resolve(strict=False)
+    if os.name == "nt":
         try:
-            if os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-                return Path(os.path.realpath(path)).resolve()
+            attrs = os.lstat(path).st_file_attributes
+            if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                # Broken junctions are reparse points even when path.is_dir() is false.
+                return Path(os.path.realpath(path)).resolve(strict=False)
         except (AttributeError, OSError):
             pass
     return None
@@ -374,9 +464,17 @@ def resolve_scope(adapter, user=False, project=None, default_project=True):
 
 
 def _mount_plan(skill, source, adapters, user=False, project=None, force=False):
-    plan = []
+    scopes = []
     for adapter in adapters:
         scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        scopes.append((adapter, scope, target_dir))
+
+    ensure_distinct_targets(
+        [(adapter.name, scope, target_dir) for adapter, scope, target_dir in scopes]
+    )
+
+    plan = []
+    for adapter, scope, target_dir in scopes:
         link = target_dir / skill
         current = link_target(link)
         action = "mount"
@@ -428,9 +526,17 @@ def mount(skill, user=False, project=None, dry_run=False, force=False, agents=No
 
 def unmount(skill, user=False, project=None, dry_run=False, agents=None):
     adapters = runtime_adapters(agents)
-    plan = []
+    scopes = []
     for adapter in adapters:
         scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        scopes.append((adapter, scope, target_dir))
+
+    ensure_distinct_targets(
+        [(adapter.name, scope, target_dir) for adapter, scope, target_dir in scopes]
+    )
+
+    plan = []
+    for adapter, scope, target_dir in scopes:
         link = target_dir / skill
         if not os.path.lexists(link):
             plan.append((adapter, scope, link, None, "missing"))
@@ -461,10 +567,10 @@ def _relative_to_library(path):
     candidate = Path(path)
     try:
         candidate = candidate.resolve(strict=False)
-    except TypeError:
+    except (OSError, RuntimeError):
         candidate = Path(os.path.abspath(candidate))
     for root in configured_library_roots(include_missing=True):
-        root = root.resolve()
+        root = root.resolve(strict=False)
         try:
             return root, candidate.relative_to(root)
         except ValueError:
@@ -519,7 +625,11 @@ def list_target(runtime, scope, target_dir, skills):
     rows = []
     if not target_dir.is_dir():
         return rows
-    for entry in sorted(target_dir.iterdir(), key=lambda p: p.name):
+    try:
+        entries = sorted(target_dir.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise LibrarianError(f"Cannot inspect runtime target {target_dir}: {exc}") from exc
+    for entry in entries:
         status, resolved = describe_entry(entry, skills)
         rows.append(
             {
@@ -553,6 +663,8 @@ def selected_targets(user=False, project=None, include_default_both=False, agent
                 result.append((adapter.name, "project", project_dir))
             continue
         result.append((adapter.name, "project", adapter.project_target(".")))
+
+    ensure_distinct_targets(result)
     return result
 
 
@@ -638,10 +750,27 @@ def doctor(user=False, project=None, agents=None):
     notes = []
 
     cfg = config()
-    for raw in cfg.get("libraries", []):
-        root = Path(os.path.expanduser(raw)).resolve()
+    raw_libraries = cfg.get("libraries", [])
+    if not isinstance(raw_libraries, list):
+        issues.append("libraries must be a JSON list of absolute path strings")
+        raw_libraries = []
+    for raw in raw_libraries:
+        try:
+            root = absolute_config_path(raw, "libraries[]")
+        except LibrarianError as exc:
+            issues.append(str(exc))
+            continue
         if not root.is_dir():
             issues.append(f"configured library is missing: {short(root)}")
+
+    # Force strict runtime configuration validation even when a selected target
+    # directory does not yet exist.
+    try:
+        runtime_config_root()
+        for adapter in RUNTIME_ADAPTERS.values():
+            adapter.runtime_config()
+    except LibrarianError as exc:
+        issues.append(str(exc))
 
     skills, clashes = discover_skills()
     for name, source in skills.items():
@@ -657,12 +786,17 @@ def doctor(user=False, project=None, agents=None):
             f"duplicate source name '{name}': using {short(kept)}, ignoring {short(ignored)}"
         )
 
-    targets = selected_targets(
-        user=user,
-        project=project,
-        include_default_both=True,
-        agents=agents,
-    )
+    try:
+        targets = selected_targets(
+            user=user,
+            project=project,
+            include_default_both=True,
+            agents=agents,
+        )
+    except LibrarianError as exc:
+        issues.append(str(exc))
+        targets = []
+
     mounted_by_runtime_scope = {}
     project_roots = {}
 
@@ -679,7 +813,13 @@ def doctor(user=False, project=None, agents=None):
             issues.append(f"{runtime}:{scope} target is not a directory: {short(target)}")
             continue
 
-        for entry in sorted(target.iterdir(), key=lambda p: p.name):
+        try:
+            entries = sorted(target.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            issues.append(f"cannot inspect {runtime}:{scope} target {short(target)}: {exc}")
+            continue
+
+        for entry in entries:
             mounted_by_runtime_scope[key].add(entry.name)
             status, resolved = describe_entry(entry, skills)
             label = f"{runtime}:{scope}"
@@ -729,8 +869,11 @@ def doctor(user=False, project=None, agents=None):
 def legacy_targets():
     seen = set()
     result = []
-    for raw in config().get("targets", DEFAULT_TARGETS):
-        target = Path(os.path.expanduser(raw)).resolve()
+    raw_targets = config().get("targets", DEFAULT_TARGETS)
+    if not isinstance(raw_targets, list):
+        raise LibrarianError("targets must be a JSON list of absolute path strings")
+    for raw in raw_targets:
+        target = absolute_config_path(raw, "targets[]")
         if target in seen:
             continue
         seen.add(target)
