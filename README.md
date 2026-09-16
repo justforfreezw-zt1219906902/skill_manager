@@ -5,14 +5,20 @@ A small framework for maintaining **portable agent skills** with one source of t
 The intended model is:
 
 ```text
-central skill Git repo
+personal-agent-skills/                  canonical Git source of truth
         |
-        +--> ~/.agents/skills/       Codex user scope
-        |
-        +--> <repo>/.agents/skills/  Codex project scope
+        +--> skill_manager              control plane
+                 |
+                 +--> CodexAdapter
+                 |      +--> ~/.agents/skills/
+                 |      +--> <repo>/.agents/skills/
+                 |
+                 +--> ClaudeCodeAdapter
+                        +--> ~/.claude/skills/
+                        +--> <repo>/.claude/skills/
 ```
 
-The central library is the source of truth. Runtime directories should normally contain symlinks on macOS/Linux or directory junctions on Windows, so edits or `git pull` in the library propagate without copies drifting apart.
+Runtime directories are deployment views. Managed skills are symlinks on macOS/Linux or directory junctions on Windows, so edits or `git pull` in the source library propagate without copied directories drifting apart.
 
 ## Requirements
 
@@ -28,20 +34,51 @@ Copy the machine-specific example:
 cp deploy.example.json deploy.json
 ```
 
-For Codex-oriented usage with a grouped personal library, a typical file is:
+A typical personal configuration is:
 
 ```json
 {
   "libraries": ["/Users/you/source/personal-agent-skills"],
   "ignored_directories": ["retire_skills"],
-  "user_target": "/Users/you/.agents/skills",
-  "targets": ["/Users/you/.agents/skills"]
+  "runtimes": {
+    "codex": {
+      "enabled": true
+    },
+    "claude-code": {
+      "enabled": true
+    }
+  },
+  "targets": [
+    "/Users/you/.agents/skills",
+    "/Users/you/.claude/skills"
+  ]
 }
 ```
 
-`deploy.json` is git-ignored. Use absolute paths.
+`deploy.json` is git-ignored. `libraries` should use absolute paths. Runtime paths have safe defaults and normally do not need to be configured:
 
-`libraries` points at source-library roots. Discovery is recursive, so both of these layouts work:
+| Runtime | User scope | Project scope |
+| --- | --- | --- |
+| Codex | `~/.agents/skills` | `<repo>/.agents/skills` |
+| Claude Code | `~/.claude/skills` | `<repo>/.claude/skills` |
+
+Optional per-runtime overrides are supported:
+
+```json
+{
+  "runtimes": {
+    "codex": {
+      "enabled": true,
+      "user_target": "/custom/codex/skills",
+      "project_target": ".agents/skills"
+    }
+  }
+}
+```
+
+`project_target` must be relative to the Git root. The old top-level `user_target` still overrides the Codex user target for backward compatibility.
+
+`libraries` points at source-library roots. Discovery is recursive, so both flat and grouped layouts work:
 
 ```text
 personal-agent-skills/
@@ -56,7 +93,7 @@ A directory containing `SKILL.md` is treated as a skill boundary and is not sear
 
 ## Scoped skill management
 
-The preferred interface for new Codex workflows is:
+The scoped CLI is the preferred interface:
 
 ```bash
 python3 skill-librarian/scripts/skill_librarian.py available
@@ -64,12 +101,14 @@ python3 skill-librarian/scripts/skill_librarian.py list
 python3 skill-librarian/scripts/skill_librarian.py doctor
 ```
 
-### Mount to the current project
+For compatibility with v0.2, scoped commands target **Codex by default**. Select another runtime with `--agent` / `-a`, repeat it for multiple runtimes, or use `--agent all`.
 
-From any directory inside a Git repo:
+### Mount to a project
+
+From inside the target Git repo, Codex remains the default:
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py mount reconstruction-geometry
+python3 skill-librarian/scripts/skill_librarian.py mount reconstruction-geometry
 ```
 
 This mounts into:
@@ -78,59 +117,125 @@ This mounts into:
 <git-root>/.agents/skills/reconstruction-geometry
 ```
 
-Explicit project:
+Mount to Claude Code instead:
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
-  mount reconstruction-geometry --project /path/to/repo
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --agent claude-code
 ```
 
-The category path in the source library does not appear in the runtime mount. A source at `3d_reconstruction_skills/reconstruction-geometry` still mounts as `.agents/skills/reconstruction-geometry`.
+Mount to both runtimes:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --agent codex --agent claude-code
+```
+
+or:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --agent all
+```
+
+Explicit project path:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --project /path/to/repo --agent all
+```
+
+The category path in the source library does not appear in the runtime mount. A source at `3d_reconstruction_skills/reconstruction-geometry` mounts using only the skill basename.
 
 ### Mount as a user skill
 
+Codex user scope:
+
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py \
-  mount skill-librarian --user
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --user
 ```
 
-This targets `~/.agents/skills` unless `user_target` overrides it.
+Both supported user scopes:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  mount reconstruction-geometry --user --agent all
+```
 
 ### Unmount
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount reconstruction-geometry
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py unmount skill-librarian --user
+python3 skill-librarian/scripts/skill_librarian.py \
+  unmount reconstruction-geometry --user --agent codex
 ```
 
-Unmounting removes links only. It refuses to delete a real directory or file.
+`unmount` removes links/junctions only. It refuses to delete a real directory or file. Multi-runtime mount/unmount operations preflight targets first so a blocked runtime does not silently leave a partial operation.
 
-### Inspect mounts
+## Runtime inspection and unmanaged detection
+
+`list` reports the runtime, scope, skill name, status, and resolved target:
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py list
+python3 skill-librarian/scripts/skill_librarian.py list --agent all
 ```
 
-Without an explicit scope, `list` shows user scope and the current Git project's scope when available.
-
-### Diagnose problems
+For automation, use stable JSON output:
 
 ```bash
-python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py doctor
+python3 skill-librarian/scripts/skill_librarian.py list --agent all --json
 ```
 
-`doctor` checks missing libraries, duplicate skill names, broken/wrong links, real directories in managed targets, duplicate user/project mounts, malformed `SKILL.md` names, project symlinks accidentally tracked by Git, and links that still point into ignored/retired source subtrees.
+The JSON object has a `mounts` array. Every row contains:
+
+```text
+runtime
+scope
+name
+status
+path
+target
+```
+
+Current status values are:
+
+- `MANAGED` - the runtime entry points at the canonical active source.
+- `UNMANAGED` - a real directory/file or external link exists in a managed runtime directory but is not owned by the canonical libraries.
+- `BROKEN_LINK` - the entry is a broken link outside the managed libraries.
+- `WRONG_LINK` - the skill name exists in the canonical library but the runtime link points elsewhere.
+- `RETIRED` - the runtime still points into an ignored/retired source subtree.
+- `MISSING_SOURCE` - the runtime link points into a managed library location whose source no longer exists.
+
+This is intentionally strict: a skill installed directly by Codex, Claude Code, `npx skills`, or another tool is **unmanaged** until a future `adopt` workflow brings it into the canonical library.
+
+## Doctor
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py doctor --agent all
+```
+
+`doctor` checks:
+
+- missing configured libraries;
+- malformed or mismatched `SKILL.md` names;
+- duplicate active skill names across source paths;
+- unmanaged runtime entries;
+- broken, wrong, retired, or missing-source links;
+- duplicate user/project mounts within the same runtime;
+- project mounts accidentally tracked by Git.
+
+The same skill mounted into Codex and Claude Code is expected and is **not** treated as a duplicate. A duplicate means the same skill is simultaneously mounted at user and project scope inside one runtime.
 
 ## Safety behavior
 
 - The source library is never modified by `mount` or `unmount`.
-- `mount` refuses to replace a real directory/file.
-- `unmount` refuses to delete a real directory/file.
+- `mount` refuses to replace unmanaged real directories/files.
+- `unmount` refuses to delete unmanaged real directories/files.
 - An existing wrong link is repaired only with `--force`.
 - Skills below ignored directories such as `retire_skills` are not available for mounting.
-- `doctor` fails when a runtime mount still points into an ignored/retired subtree.
-- Project mounts use absolute local paths, so they are normally **not committed** to the project repository.
-- Avoid mounting the same skill name at both user and project scope.
+- `doctor` fails when a runtime still points into an ignored/retired source subtree.
+- Project mounts use absolute local links and are normally **not committed** to the project repository.
+- Avoid mounting the same skill at both user and project scope for one runtime.
 
 ## Legacy bulk deployment
 
@@ -142,7 +247,7 @@ python3 deploy.py --dry-run
 python3 deploy.py --skill NAME
 ```
 
-Legacy deployment uses the same recursive source discovery and ignore rules.
+Legacy deployment still uses the `targets` array and the same recursive source discovery/ignore rules. New workflows should use scoped `mount` / `unmount` commands and runtime adapters instead.
 
 ## Recommended ownership
 
@@ -150,14 +255,26 @@ For a personal setup:
 
 ```text
 personal-agent-skills/                     # Git source of truth
-├── 3d_reconstruction_skills/              # optional category/group
+├── 3d_reconstruction_skills/
 │   └── reconstruction-geometry/
 └── retire_skills/                         # ignored by discovery
     └── agent-state/
 
-skill_manager/                             # management/migration tool
-~/.agents/skills/                          # user-scoped links only
-<repo>/.agents/skills/                     # project-scoped links only
+skill_manager/                             # control plane
+~/.agents/skills/                          # Codex user links only
+~/.claude/skills/                          # Claude Code user links only
+<repo>/.agents/skills/                     # Codex project links only
+<repo>/.claude/skills/                     # Claude Code project links only
 ```
 
-That keeps “what the skill is” in Git, while user/project directories only express where an active skill is mounted.
+That keeps **what the skill is** in Git while runtime directories express only **where an active skill is mounted**.
+
+## Roadmap
+
+The runtime adapter layer and unmanaged detection are the foundation for the next lifecycle commands:
+
+```text
+v0.4  adopt unmanaged runtime skills into the canonical library
+v0.5  import external skills + provenance metadata
+v0.6  upstream diff / update
+```
