@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import importlib.util
 
@@ -144,6 +145,25 @@ class SkillSourceTests(unittest.TestCase):
 
         self.assertEqual(metadata["ref"], "v1")
         self.assertEqual(metadata["revision"], first)
+
+    def test_git_error_redacts_credential_bearing_source(self):
+        raw = "https://token@example.com/acme/private.git?secret=1"
+        failure = subprocess.CompletedProcess(
+            ["git", "clone"],
+            128,
+            stdout="",
+            stderr=f"fatal: unable to access '{raw}': denied",
+        )
+        with mock.patch.object(source_mod.subprocess, "run", return_value=failure):
+            with self.assertRaises(source_mod.SourceError) as ctx:
+                source_mod._run_git(
+                    ["clone", "--quiet", raw, "/tmp/dest"],
+                    sensitive_values=(raw,),
+                )
+        message = str(ctx.exception)
+        self.assertNotIn("token", message)
+        self.assertNotIn("secret=1", message)
+        self.assertIn("https://example.com/acme/private.git", message)
 
     def test_find_skill_respects_skill_boundaries(self):
         source_root = self.root / "source-boundary"
