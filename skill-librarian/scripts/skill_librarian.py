@@ -839,6 +839,25 @@ def paths_overlap(a, b):
         return False
 
 
+def validate_adopt_category_ancestry(library_root, category_path):
+    """Ensure the category is a discoverable grouping path, not inside a skill boundary/link."""
+    current = Path(library_root).resolve(strict=False)
+    for part in category_path.parts:
+        current = current / part
+        if not os.path.lexists(current):
+            continue
+        if current.is_symlink() or link_target(current) is not None:
+            raise LibrarianError(
+                f"Adopt category cannot traverse a symlink/junction: {short(current)}"
+            )
+        if not current.is_dir():
+            raise LibrarianError(f"Adopt category component is not a directory: {short(current)}")
+        if (current / "SKILL.md").is_file():
+            raise LibrarianError(
+                f"Adopt category is inside existing skill boundary: {short(current)}"
+            )
+
+
 def validate_adopt_skill_tree(source, skill):
     source = Path(source)
     if not source.is_dir():
@@ -931,6 +950,7 @@ def adopt(
 
     library_root = resolve_adopt_library(library)
     category_path = adopt_category_path(category)
+    validate_adopt_category_ancestry(library_root, category_path)
     destination = library_root / category_path / skill
     ensure_inside_root(destination, library_root, "Adopt destination")
 
@@ -970,6 +990,12 @@ def adopt(
         os.replace(staged_skill, destination)
         destination_created = True
 
+        discovered_after_copy, _ = discover_skills()
+        if discovered_after_copy.get(skill) != destination.resolve():
+            raise LibrarianError(
+                f"Adopt destination is not discoverable as canonical skill '{skill}': {short(destination)}"
+            )
+
         target_dir.mkdir(parents=True, exist_ok=True)
         if os.path.lexists(backup):
             raise LibrarianError(f"Unexpected adopt backup collision: {short(backup)}")
@@ -977,6 +1003,13 @@ def adopt(
         runtime_moved = True
 
         make_link(destination, runtime_entry)
+
+        adopted_skills, _ = discover_skills()
+        final_status, final_target = describe_entry(runtime_entry, adopted_skills)
+        if final_status != STATUS_MANAGED or final_target != destination.resolve():
+            raise LibrarianError(
+                f"Adopt final verification failed: {short(runtime_entry)} is {final_status}"
+            )
     except Exception as exc:
         rollback_errors = []
         try:
@@ -1008,13 +1041,6 @@ def adopt(
         print(
             f"WARNING: adopted '{skill}' but could not remove backup {short(backup)}: {cleanup_exc}",
             file=sys.stderr,
-        )
-
-    adopted_skills, _ = discover_skills()
-    final_status, final_target = describe_entry(runtime_entry, adopted_skills)
-    if final_status != STATUS_MANAGED or final_target != destination.resolve():
-        raise LibrarianError(
-            f"Adopt completed filesystem changes but verification failed: {short(runtime_entry)} is {final_status}"
         )
 
     print(f"ADOPTED  {skill} [{label}] {short(runtime_entry)} -> {short(destination)}")
