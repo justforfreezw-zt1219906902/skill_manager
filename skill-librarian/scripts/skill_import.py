@@ -220,7 +220,7 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
+def main(argv=None, control=None):
     args = build_parser().parse_args(argv)
     try:
         return import_skill(
@@ -230,6 +230,7 @@ def main(argv=None):
             category=args.category,
             ref=args.ref,
             dry_run=args.dry_run,
+            control=control,
         )
     except ImportWorkflowError as exc:
         print(f"error: {exc}", file=sys.stderr)
