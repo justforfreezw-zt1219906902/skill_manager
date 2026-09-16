@@ -1,6 +1,6 @@
 interface:
   display_name: Skill Librarian
-  short_description: Manage grouped Git-backed skill libraries and scoped mounts.
+  short_description: Manage Git-backed skill libraries across Codex and Claude Code runtimes.
 policy:
   products:
   - chatgpt
