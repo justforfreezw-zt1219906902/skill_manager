@@ -1,6 +1,16 @@
 {
   "libraries": ["/Users/<username>/source/personal-agent-skills"],
   "ignored_directories": ["retire_skills"],
-  "user_target": "/Users/<username>/.agents/skills",
-  "targets": ["/Users/<username>/.agents/skills"]
+  "runtimes": {
+    "codex": {
+      "enabled": true
+    },
+    "claude-code": {
+      "enabled": true
+    }
+  },
+  "targets": [
+    "/Users/<username>/.agents/skills",
+    "/Users/<username>/.claude/skills"
+  ]
 }
