@@ -188,11 +188,27 @@ class AdoptTests(unittest.TestCase):
         self.assertTrue(runtime_skill.is_dir())
         self.assertFalse((self.root / "outside" / "foo").exists())
 
+    def test_adopt_rejects_skill_name_path_escape(self):
+        self.make_runtime_skill("foo")
+        with self.assertRaises(cli.LibrarianError):
+            cli.adopt("../foo", user=True)
+        self.assertFalse((self.library / "imported" / "foo").exists())
+
     def test_adopt_rejects_internal_link_outside_skill_tree(self):
         runtime_skill = self.make_runtime_skill("foo")
         outside = self.root / "outside.txt"
         outside.write_text("outside")
         os.symlink(outside, runtime_skill / "outside-link")
+
+        with self.assertRaises(cli.LibrarianError):
+            cli.adopt("foo", user=True)
+
+        self.assertTrue(runtime_skill.is_dir())
+        self.assertFalse((self.library / "imported" / "foo").exists())
+
+    def test_adopt_rejects_absolute_internal_link_even_when_target_is_inside(self):
+        runtime_skill = self.make_runtime_skill("foo")
+        os.symlink(runtime_skill / "payload.txt", runtime_skill / "absolute-internal-link")
 
         with self.assertRaises(cli.LibrarianError):
             cli.adopt("foo", user=True)
