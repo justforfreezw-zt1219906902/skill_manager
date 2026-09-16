@@ -72,7 +72,7 @@ def _looks_like_local_path(source):
 
 
 def sanitize_recorded_source(source):
-    """Remove URL credentials/query/fragment before provenance is committed."""
+    """Remove credentials/machine-local details before provenance is committed."""
     if not isinstance(source, str) or not source:
         return source
 
@@ -81,6 +81,9 @@ def sanitize_recorded_source(source):
         return source
 
     parsed = urlsplit(source)
+    if parsed.scheme == "file":
+        # Never commit a machine-specific absolute filesystem URL into canonical provenance.
+        return None
     if parsed.scheme not in {"http", "https", "ssh", "git"}:
         return source
 
@@ -262,7 +265,12 @@ def find_skill(source, skill_name):
         except ValueError as exc:
             raise SourceError(f"Source path hint escapes checkout: {source.path_hint}") from exc
         if hinted.is_dir() and consider(hinted):
-            return hinted
+            if candidates:
+                return hinted
+            found_name = _frontmatter_name(hinted / "SKILL.md")
+            raise SourceError(
+                f"Source path hint is skill '{found_name}', not requested '{skill_name}'"
+            )
 
     if consider(root):
         if candidates:
