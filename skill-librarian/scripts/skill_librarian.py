@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manage portable agent skills and link them into Codex/user/project scopes.
+Manage portable agent skills and link them into Codex, Claude Code, and project scopes.
 
 The source skill library remains the source of truth. Runtime directories contain
 links, not copies, so edits or git pulls in the library propagate immediately.
@@ -13,10 +13,14 @@ not scanned; retire_skills is ignored by default.
 Scoped commands:
 
     skill-librarian available
-    skill-librarian mount NAME [--user | --project REPO]
-    skill-librarian unmount NAME [--user | --project REPO]
-    skill-librarian list [--user | --project REPO]
-    skill-librarian doctor [--user | --project REPO]
+    skill-librarian mount NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian unmount NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian list [--user | --project REPO] [-a RUNTIME] [--json]
+    skill-librarian doctor [--user | --project REPO] [-a RUNTIME]
+
+Runtime defaults preserve the v0.2 behavior: scoped commands target Codex unless
+--agent is supplied. Repeat --agent to target more than one runtime, or use
+--agent all. Built-in adapters are codex and claude-code.
 
 For mount/unmount, omitting a scope means the current Git repository.
 For list/doctor, omitting a scope inspects user scope plus the current Git
@@ -44,13 +48,103 @@ SCRIPT_PATH = Path(__file__).resolve()
 SKILL_DIR = SCRIPT_PATH.parent.parent
 FRAMEWORK_ROOT = SKILL_DIR.parent
 DEFAULT_TARGETS = ["~/.claude/skills", "~/.agents/skills"]
-DEFAULT_USER_TARGET = "~/.agents/skills"
 DEFAULT_IGNORED_DIRECTORIES = ("retire_skills",)
+DEFAULT_RUNTIME = "codex"
 SCOPED_COMMANDS = {"mount", "unmount", "list", "available", "doctor"}
+
+STATUS_MANAGED = "MANAGED"
+STATUS_UNMANAGED = "UNMANAGED"
+STATUS_BROKEN_LINK = "BROKEN_LINK"
+STATUS_WRONG_LINK = "WRONG_LINK"
+STATUS_RETIRED = "RETIRED"
+STATUS_MISSING_SOURCE = "MISSING_SOURCE"
 
 
 class LibrarianError(RuntimeError):
     pass
+
+
+class RuntimeAdapter:
+    """Resolve runtime-specific user and project skill directories."""
+
+    def __init__(self, name, default_user_target, project_relative, aliases=()):
+        self.name = name
+        self.default_user_target = default_user_target
+        self.project_relative = Path(project_relative)
+        self.aliases = tuple(aliases)
+
+    def runtime_config(self):
+        runtimes = config().get("runtimes", {})
+        if runtimes is None:
+            return {}
+        if not isinstance(runtimes, dict):
+            raise LibrarianError("runtimes must be a JSON object")
+        raw = runtimes.get(self.name, {})
+        if raw is False:
+            return {"enabled": False}
+        if raw is True or raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise LibrarianError(f"runtimes.{self.name} must be a JSON object or boolean")
+        return raw
+
+    def is_enabled(self):
+        return self.runtime_config().get("enabled", True) is not False
+
+    def user_target(self):
+        runtime_cfg = self.runtime_config()
+        explicit = runtime_cfg.get("user_target")
+        if explicit:
+            return Path(os.path.expanduser(explicit)).resolve()
+
+        # Backward compatibility: v0.2 used top-level user_target only for Codex.
+        if self.name == "codex":
+            cfg = config()
+            explicit = cfg.get("user_target")
+            if explicit:
+                return Path(os.path.expanduser(explicit)).resolve()
+            for target in cfg.get("targets", []):
+                expanded = Path(os.path.expanduser(target)).resolve()
+                if expanded.as_posix().rstrip("/").endswith("/.agents/skills"):
+                    return expanded
+
+        return Path(os.path.expanduser(self.default_user_target)).resolve()
+
+    def project_target(self, path=".", required=True):
+        root = git_root(path, required=required)
+        if root is None:
+            return None
+        runtime_cfg = self.runtime_config()
+        relative = runtime_cfg.get("project_target")
+        if relative:
+            candidate = Path(os.path.expanduser(relative))
+            if candidate.is_absolute():
+                raise LibrarianError(
+                    f"runtimes.{self.name}.project_target must be relative to the Git root"
+                )
+            return root / candidate
+        return root / self.project_relative
+
+
+RUNTIME_ADAPTERS = {
+    "codex": RuntimeAdapter(
+        "codex",
+        "~/.agents/skills",
+        ".agents/skills",
+    ),
+    "claude-code": RuntimeAdapter(
+        "claude-code",
+        "~/.claude/skills",
+        ".claude/skills",
+        aliases=("claude",),
+    ),
+}
+
+RUNTIME_ALIASES = {
+    alias: name
+    for name, adapter in RUNTIME_ADAPTERS.items()
+    for alias in adapter.aliases
+}
 
 
 def _read_json(path):
@@ -136,7 +230,6 @@ def iter_skill_dirs(root):
                 continue
             if (child / "SKILL.md").is_file():
                 found.append(child)
-                # A skill is a discovery boundary. Do not treat nested resources as skills.
                 continue
             # Do not recurse through grouping-directory symlinks. A symlink that is itself
             # a skill is still accepted above for backward compatibility.
@@ -164,22 +257,6 @@ def discover_skills():
     return found, clashes
 
 
-def user_target():
-    cfg = config()
-    explicit = cfg.get("user_target")
-    if explicit:
-        return Path(os.path.expanduser(explicit)).resolve()
-
-    # Backward-compatible with existing deploy.json files that only have targets.
-    for target in cfg.get("targets", []):
-        expanded = Path(os.path.expanduser(target)).resolve()
-        normalized = expanded.as_posix().rstrip("/")
-        if normalized.endswith("/.agents/skills"):
-            return expanded
-
-    return Path(os.path.expanduser(DEFAULT_USER_TARGET)).resolve()
-
-
 def git_root(path=".", required=True):
     candidate = Path(path).expanduser().resolve()
     try:
@@ -196,8 +273,48 @@ def git_root(path=".", required=True):
         return None
 
 
+def normalize_runtime_name(name):
+    name = name.strip().lower()
+    return RUNTIME_ALIASES.get(name, name)
+
+
+def runtime_adapters(agents=None):
+    """Resolve CLI agent selectors to distinct built-in runtime adapters."""
+    requested = list(agents or [DEFAULT_RUNTIME])
+    if not requested:
+        requested = [DEFAULT_RUNTIME]
+
+    normalized = [normalize_runtime_name(value) for value in requested]
+    if "all" in normalized:
+        if len(normalized) > 1:
+            raise LibrarianError("--agent all cannot be combined with other --agent values")
+        names = [name for name, adapter in RUNTIME_ADAPTERS.items() if adapter.is_enabled()]
+    else:
+        names = normalized
+
+    result = []
+    seen = set()
+    for name in names:
+        adapter = RUNTIME_ADAPTERS.get(name)
+        if adapter is None:
+            available = ", ".join(sorted(RUNTIME_ADAPTERS))
+            raise LibrarianError(f"Unknown runtime '{name}'. Available: {available}, all")
+        if not adapter.is_enabled():
+            raise LibrarianError(f"Runtime '{name}' is disabled in deploy.json")
+        if name not in seen:
+            seen.add(name)
+            result.append(adapter)
+    return result
+
+
+def user_target():
+    """Backward-compatible Codex user target accessor."""
+    return RUNTIME_ADAPTERS["codex"].user_target()
+
+
 def project_target(path="."):
-    return git_root(path, required=True) / ".agents" / "skills"
+    """Backward-compatible Codex project target accessor."""
+    return RUNTIME_ADAPTERS["codex"].project_target(path)
 
 
 def link_target(path):
@@ -244,152 +361,231 @@ def make_link(src, link):
         os.symlink(src, link)
 
 
-def resolve_scope(user=False, project=None, default_project=True):
+def resolve_scope(adapter, user=False, project=None, default_project=True):
     if user and project is not None:
         raise LibrarianError("Choose only one scope: --user or --project REPO")
     if user:
-        return "user", user_target()
+        return "user", adapter.user_target()
     if project is not None:
-        return "project", project_target(project)
+        return "project", adapter.project_target(project)
     if default_project:
-        return "project", project_target(".")
+        return "project", adapter.project_target(".")
     return None, None
 
 
-def mount(skill, user=False, project=None, dry_run=False, force=False):
+def _mount_plan(skill, source, adapters, user=False, project=None, force=False):
+    plan = []
+    for adapter in adapters:
+        scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        link = target_dir / skill
+        current = link_target(link)
+        action = "mount"
+        if current == source:
+            action = "ok"
+        elif os.path.lexists(link):
+            if current is None:
+                raise LibrarianError(
+                    f"Refusing to replace unmanaged real path {short(link)} for {adapter.name}. "
+                    "Adopt or move it manually first."
+                )
+            if not force:
+                raise LibrarianError(
+                    f"{short(link)} for {adapter.name} points to {short(current)}, not {short(source)}. "
+                    "Use --force only if you intend to repair that link."
+                )
+            action = "repair"
+        plan.append((adapter, scope, target_dir, link, current, action))
+    return plan
+
+
+def mount(skill, user=False, project=None, dry_run=False, force=False, agents=None):
     skills, _ = discover_skills()
     if skill not in skills:
         available_names = ", ".join(sorted(skills)) or "(none)"
         raise LibrarianError(f"Unknown skill '{skill}'. Available: {available_names}")
 
-    scope, target_dir = resolve_scope(user=user, project=project, default_project=True)
-    src = skills[skill]
-    link = target_dir / skill
-    current = link_target(link)
+    source = skills[skill]
+    adapters = runtime_adapters(agents)
+    plan = _mount_plan(skill, source, adapters, user=user, project=project, force=force)
 
-    if current == src:
-        print(f"OK       {skill} already mounted in {scope}: {short(link)}")
-        return 0
+    for adapter, scope, target_dir, link, current, action in plan:
+        label = f"{adapter.name}:{scope}"
+        if action == "ok":
+            print(f"OK       {skill} already mounted [{label}]: {short(link)}")
+            continue
+        if dry_run:
+            verb = "REPAIR" if action == "repair" else "MOUNT"
+            print(f"{verb:8} {skill} [{label}] {short(link)} -> {short(source)}")
+            continue
+        if action == "repair":
+            remove_link(link)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        make_link(source, link)
+        verb = "REPAIRED" if action == "repair" else "MOUNTED"
+        print(f"{verb:8} {skill} [{label}] {short(link)} -> {short(source)}")
+    return 0
 
-    if os.path.lexists(link):
+
+def unmount(skill, user=False, project=None, dry_run=False, agents=None):
+    adapters = runtime_adapters(agents)
+    plan = []
+    for adapter in adapters:
+        scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        link = target_dir / skill
+        if not os.path.lexists(link):
+            plan.append((adapter, scope, link, None, "missing"))
+            continue
+        current = link_target(link)
         if current is None:
             raise LibrarianError(
-                f"Refusing to replace real path {short(link)}. Move it manually if it is intentional."
+                f"Refusing to delete unmanaged real path {short(link)} for {adapter.name}. "
+                "unmount removes links only."
             )
-        if not force:
-            raise LibrarianError(
-                f"{short(link)} points to {short(current)}, not {short(src)}. "
-                "Use --force only if you intend to repair that link."
-            )
+        plan.append((adapter, scope, link, current, "remove"))
+
+    for adapter, scope, link, current, action in plan:
+        label = f"{adapter.name}:{scope}"
+        if action == "missing":
+            print(f"OK       {skill} is not mounted [{label}]: {short(link)}")
+            continue
         if dry_run:
-            print(f"REPAIR   {short(link)} -> {short(src)}")
-            return 0
+            print(f"UNMOUNT  {skill} [{label}] {short(link)}")
+            continue
         remove_link(link)
-
-    if dry_run:
-        print(f"MOUNT    {skill} [{scope}] {short(link)} -> {short(src)}")
-        return 0
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    make_link(src, link)
-    print(f"MOUNTED  {skill} [{scope}] {short(link)} -> {short(src)}")
+        print(f"UNMOUNTED {skill} [{label}] {short(link)}")
     return 0
 
 
-def unmount(skill, user=False, project=None, dry_run=False):
-    scope, target_dir = resolve_scope(user=user, project=project, default_project=True)
-    link = target_dir / skill
-
-    if not os.path.lexists(link):
-        print(f"OK       {skill} is not mounted in {scope}: {short(link)}")
-        return 0
-
-    current = link_target(link)
-    if current is None:
-        raise LibrarianError(
-            f"Refusing to delete real path {short(link)}. unmount removes links only."
-        )
-
-    if dry_run:
-        print(f"UNMOUNT  {skill} [{scope}] {short(link)}")
-        return 0
-
-    remove_link(link)
-    print(f"UNMOUNTED {skill} [{scope}] {short(link)}")
-    return 0
+def _relative_to_library(path):
+    """Return (root, relative) when path is lexically below a configured library."""
+    candidate = Path(path)
+    try:
+        candidate = candidate.resolve(strict=False)
+    except TypeError:
+        candidate = Path(os.path.abspath(candidate))
+    for root in configured_library_roots(include_missing=True):
+        root = root.resolve()
+        try:
+            return root, candidate.relative_to(root)
+        except ValueError:
+            continue
+    return None, None
 
 
 def is_ignored_library_source(path):
     """Return True when path is inside an ignored subtree of a configured library."""
-    resolved = Path(path).resolve()
+    root, relative = _relative_to_library(path)
+    if root is None:
+        return False
     ignored = ignored_directory_names()
-    for root in configured_library_roots():
-        try:
-            relative = resolved.relative_to(root.resolve())
-        except ValueError:
-            continue
-        if any(part in ignored for part in relative.parts):
-            return True
-    return False
+    return any(part in ignored for part in relative.parts)
+
+
+def is_managed_library_path(path):
+    root, relative = _relative_to_library(path)
+    return root is not None and not any(part in ignored_directory_names() for part in relative.parts)
 
 
 def describe_entry(entry, known_sources):
+    """Classify one runtime entry against the canonical source libraries."""
+    entry = Path(entry)
     current = link_target(entry)
     if current is not None:
-        if not entry.exists():
-            return "broken", current
         expected = known_sources.get(entry.name)
-        if expected == current:
-            return "linked", current
-        if expected is None:
+        if not entry.exists():
             if is_ignored_library_source(current):
-                return "retired-link", current
-            return "external-link", current
-        return "wrong-link", current
-    if entry.is_dir():
-        return "real-dir", entry.resolve()
-    return "real-file", entry.resolve()
+                return STATUS_RETIRED, current
+            if is_managed_library_path(current):
+                return STATUS_MISSING_SOURCE, current
+            return STATUS_BROKEN_LINK, current
+        if expected == current:
+            return STATUS_MANAGED, current
+        if expected is not None:
+            return STATUS_WRONG_LINK, current
+        if is_ignored_library_source(current):
+            return STATUS_RETIRED, current
+        # An externally created link is still unmanaged from skill-librarian's point of view.
+        return STATUS_UNMANAGED, current
+
+    if os.path.lexists(entry):
+        try:
+            return STATUS_UNMANAGED, entry.resolve()
+        except OSError:
+            return STATUS_UNMANAGED, entry
+    return STATUS_BROKEN_LINK, entry
 
 
-def list_target(label, target_dir, skills):
+def list_target(runtime, scope, target_dir, skills):
     rows = []
     if not target_dir.is_dir():
         return rows
     for entry in sorted(target_dir.iterdir(), key=lambda p: p.name):
         status, resolved = describe_entry(entry, skills)
-        rows.append((label, entry.name, status, resolved))
+        rows.append(
+            {
+                "runtime": runtime,
+                "scope": scope,
+                "name": entry.name,
+                "status": status,
+                "path": str(entry),
+                "target": str(resolved),
+            }
+        )
     return rows
 
 
-def selected_targets(user=False, project=None, include_default_both=False):
+def selected_targets(user=False, project=None, include_default_both=False, agents=None):
     if user and project is not None:
         raise LibrarianError("Choose only one scope: --user or --project REPO")
-    if user:
-        return [("user", user_target())]
-    if project is not None:
-        return [("project", project_target(project))]
-    if include_default_both:
-        result = [("user", user_target())]
-        root = git_root(".", required=False)
-        if root is not None:
-            result.append(("project", root / ".agents" / "skills"))
-        return result
-    return [("project", project_target("."))]
+
+    result = []
+    for adapter in runtime_adapters(agents):
+        if user:
+            result.append((adapter.name, "user", adapter.user_target()))
+            continue
+        if project is not None:
+            result.append((adapter.name, "project", adapter.project_target(project)))
+            continue
+        if include_default_both:
+            result.append((adapter.name, "user", adapter.user_target()))
+            project_dir = adapter.project_target(".", required=False)
+            if project_dir is not None:
+                result.append((adapter.name, "project", project_dir))
+            continue
+        result.append((adapter.name, "project", adapter.project_target(".")))
+    return result
 
 
-def list_mounts(user=False, project=None):
+def collect_mount_rows(user=False, project=None, agents=None):
     skills, _ = discover_skills()
     rows = []
-    for label, target in selected_targets(user=user, project=project, include_default_both=True):
-        rows.extend(list_target(label, target, skills))
+    for runtime, scope, target in selected_targets(
+        user=user,
+        project=project,
+        include_default_both=True,
+        agents=agents,
+    ):
+        rows.extend(list_target(runtime, scope, target, skills))
+    return rows
 
-    if not rows:
-        print("No mounted skills found in the selected scope(s).")
+
+def list_mounts(user=False, project=None, agents=None, json_output=False):
+    rows = collect_mount_rows(user=user, project=project, agents=agents)
+
+    if json_output:
+        print(json.dumps({"mounts": rows}, indent=2, sort_keys=True))
         return 0
 
-    print(f"{'SCOPE':8} {'SKILL':28} {'STATUS':14} TARGET")
-    for scope, name, status, resolved in rows:
-        print(f"{scope:8} {name:28} {status:14} {short(resolved)}")
+    if not rows:
+        print("No mounted skills found in the selected runtime/scope(s).")
+        return 0
+
+    print(f"{'RUNTIME':13} {'SCOPE':8} {'SKILL':28} {'STATUS':16} TARGET")
+    for row in rows:
+        print(
+            f"{row['runtime']:13} {row['scope']:8} {row['name']:28} "
+            f"{row['status']:16} {short(row['target'])}"
+        )
     return 0
 
 
@@ -437,7 +633,7 @@ def git_tracked(project_root, path):
     return proc.returncode == 0
 
 
-def doctor(user=False, project=None):
+def doctor(user=False, project=None, agents=None):
     issues = []
     notes = []
 
@@ -461,45 +657,59 @@ def doctor(user=False, project=None):
             f"duplicate source name '{name}': using {short(kept)}, ignoring {short(ignored)}"
         )
 
-    targets = selected_targets(user=user, project=project, include_default_both=True)
-    mounted_by_scope = {}
-    project_root = None
-    if any(label == "project" for label, _ in targets):
-        project_root = git_root(project if project is not None else ".", required=False)
+    targets = selected_targets(
+        user=user,
+        project=project,
+        include_default_both=True,
+        agents=agents,
+    )
+    mounted_by_runtime_scope = {}
+    project_roots = {}
 
-    for label, target in targets:
-        mounted_by_scope[label] = set()
+    for runtime, scope, target in targets:
+        key = (runtime, scope)
+        mounted_by_runtime_scope[key] = set()
+        if scope == "project":
+            project_roots[runtime] = git_root(project if project is not None else ".", required=False)
+
         if not target.exists():
-            notes.append(f"{label} target does not exist yet: {short(target)}")
+            notes.append(f"{runtime}:{scope} target does not exist yet: {short(target)}")
             continue
         if not target.is_dir():
-            issues.append(f"{label} target is not a directory: {short(target)}")
+            issues.append(f"{runtime}:{scope} target is not a directory: {short(target)}")
             continue
+
         for entry in sorted(target.iterdir(), key=lambda p: p.name):
-            mounted_by_scope[label].add(entry.name)
+            mounted_by_runtime_scope[key].add(entry.name)
             status, resolved = describe_entry(entry, skills)
-            if status == "linked":
-                if label == "project" and project_root and git_tracked(project_root, entry):
+            label = f"{runtime}:{scope}"
+            if status == STATUS_MANAGED:
+                project_root = project_roots.get(runtime)
+                if scope == "project" and project_root and git_tracked(project_root, entry):
                     issues.append(
-                        f"project mount '{entry.name}' is tracked by Git; local absolute links are machine-specific"
+                        f"{label} mount '{entry.name}' is tracked by Git; local absolute links are machine-specific"
                     )
                 continue
-            if status == "broken":
-                issues.append(f"broken link: {short(entry)} -> {short(resolved)}")
-            elif status == "wrong-link":
-                issues.append(f"wrong link: {short(entry)} -> {short(resolved)}")
-            elif status == "retired-link":
-                issues.append(f"retired skill is still mounted: {short(entry)} -> {short(resolved)}")
-            elif status == "external-link":
-                notes.append(
-                    f"external link not managed by configured libraries: {short(entry)} -> {short(resolved)}"
-                )
+            if status == STATUS_UNMANAGED:
+                issues.append(f"{label} unmanaged runtime entry: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_BROKEN_LINK:
+                issues.append(f"{label} broken link: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_MISSING_SOURCE:
+                issues.append(f"{label} managed source is missing: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_WRONG_LINK:
+                issues.append(f"{label} wrong link: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_RETIRED:
+                issues.append(f"{label} retired skill is still mounted: {short(entry)} -> {short(resolved)}")
             else:
-                issues.append(f"real path in managed target ({status}): {short(entry)}")
+                issues.append(f"{label} unknown status {status}: {short(entry)}")
 
-    duplicate_mounts = mounted_by_scope.get("user", set()) & mounted_by_scope.get("project", set())
-    for name in sorted(duplicate_mounts):
-        issues.append(f"'{name}' is mounted in both user and project scope")
+    # Duplicate user/project mounts are only conflicts inside the same runtime.
+    for runtime in {runtime for runtime, _scope, _target in targets}:
+        duplicate_mounts = mounted_by_runtime_scope.get((runtime, "user"), set()) & mounted_by_runtime_scope.get(
+            (runtime, "project"), set()
+        )
+        for name in sorted(duplicate_mounts):
+            issues.append(f"{runtime}: '{name}' is mounted in both user and project scope")
 
     if notes:
         print("Notes:")
@@ -512,7 +722,7 @@ def doctor(user=False, project=None):
         print(f"\nDoctor found {len(issues)} issue(s).")
         return 1
 
-    print("Doctor: healthy. No skill-library or mount problems found.")
+    print("Doctor: healthy. No skill-library or runtime mount problems found.")
     return 0
 
 
@@ -542,13 +752,13 @@ def deploy_all(dry_run=False, only=None):
 
     targets = legacy_targets()
     if not targets:
-        raise LibrarianError("No existing target dirs — nothing to deploy into.")
+        raise LibrarianError("No existing target dirs - nothing to deploy into.")
 
     print(f"Skills:    {', '.join(sorted(skills))}")
     print(f"Targets:   {', '.join(short(t) for t in targets)}")
     print(
         f"Link type: {'junction (Windows)' if os.name == 'nt' else 'symlink'}"
-        + ("   [DRY RUN — no changes]" if dry_run else "")
+        + ("   [DRY RUN - no changes]" if dry_run else "")
     )
     print()
 
@@ -593,6 +803,7 @@ def deploy_all(dry_run=False, only=None):
             if dry_run:
                 print(f"  LINK      {short(link)}")
             else:
+                target.mkdir(parents=True, exist_ok=True)
                 make_link(src, link)
                 print(f"  linked    {short(link)}")
             counts["linked"] += 1
@@ -602,16 +813,25 @@ def deploy_all(dry_run=False, only=None):
     return 0
 
 
-def add_scope_args(parser, allow_force=False):
+def add_scope_args(parser, allow_force=False, allow_agent=True):
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--user", action="store_true", help="use ~/.agents/skills user scope")
-    group.add_argument("--project", metavar="REPO", help="use REPO/.agents/skills project scope")
+    group.add_argument("--user", action="store_true", help="use runtime user scope")
+    group.add_argument("--project", metavar="REPO", help="use runtime project scope under REPO")
+    if allow_agent:
+        parser.add_argument(
+            "-a",
+            "--agent",
+            dest="agents",
+            action="append",
+            metavar="RUNTIME",
+            help="runtime to manage: codex, claude-code, or all; repeatable",
+        )
     if allow_force:
         parser.add_argument("--force", action="store_true", help="repair an existing wrong link")
 
 
 def scoped_main(argv):
-    parser = argparse.ArgumentParser(description="Manage source-of-truth skills and Codex mounts.")
+    parser = argparse.ArgumentParser(description="Manage source-of-truth skills and runtime mounts.")
     subs = parser.add_subparsers(dest="command", required=True)
 
     p_available = subs.add_parser("available", help="list skills in configured source libraries")
@@ -623,7 +843,12 @@ def scoped_main(argv):
     p_mount.add_argument("--dry-run", action="store_true")
     p_mount.set_defaults(
         handler=lambda a: mount(
-            a.skill, user=a.user, project=a.project, dry_run=a.dry_run, force=a.force
+            a.skill,
+            user=a.user,
+            project=a.project,
+            dry_run=a.dry_run,
+            force=a.force,
+            agents=a.agents,
         )
     )
 
@@ -632,16 +857,32 @@ def scoped_main(argv):
     add_scope_args(p_unmount)
     p_unmount.add_argument("--dry-run", action="store_true")
     p_unmount.set_defaults(
-        handler=lambda a: unmount(a.skill, user=a.user, project=a.project, dry_run=a.dry_run)
+        handler=lambda a: unmount(
+            a.skill,
+            user=a.user,
+            project=a.project,
+            dry_run=a.dry_run,
+            agents=a.agents,
+        )
     )
 
-    p_list = subs.add_parser("list", help="list mounted skills and link health")
+    p_list = subs.add_parser("list", help="list runtime skills and management status")
     add_scope_args(p_list)
-    p_list.set_defaults(handler=lambda a: list_mounts(user=a.user, project=a.project))
+    p_list.add_argument("--json", action="store_true", dest="json_output", help="emit machine-readable JSON")
+    p_list.set_defaults(
+        handler=lambda a: list_mounts(
+            user=a.user,
+            project=a.project,
+            agents=a.agents,
+            json_output=a.json_output,
+        )
+    )
 
-    p_doctor = subs.add_parser("doctor", help="diagnose libraries, mounts, duplicates, and broken links")
+    p_doctor = subs.add_parser("doctor", help="diagnose libraries, mounts, duplicates, and unmanaged skills")
     add_scope_args(p_doctor)
-    p_doctor.set_defaults(handler=lambda a: doctor(user=a.user, project=a.project))
+    p_doctor.set_defaults(
+        handler=lambda a: doctor(user=a.user, project=a.project, agents=a.agents)
+    )
 
     args = parser.parse_args(argv)
     return args.handler(args)

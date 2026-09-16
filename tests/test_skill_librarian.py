@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -50,6 +52,13 @@ class SkillLibrarianTests(unittest.TestCase):
                 {
                     "libraries": [str(self.library)],
                     "user_target": str(self.root / "user-skills"),
+                    "runtimes": {
+                        "codex": {"enabled": True},
+                        "claude-code": {
+                            "enabled": True,
+                            "user_target": str(self.root / "claude-user-skills"),
+                        },
+                    },
                 }
             )
         )
@@ -83,15 +92,9 @@ class SkillLibrarianTests(unittest.TestCase):
         old = archive / "old-skill"
         old.mkdir()
         (old / "SKILL.md").write_text("---\nname: old-skill\ndescription: test\n---\n")
-        (self.framework / "deploy.json").write_text(
-            json.dumps(
-                {
-                    "libraries": [str(self.library)],
-                    "user_target": str(self.root / "user-skills"),
-                    "ignored_directories": ["retire_skills", "archive"],
-                }
-            )
-        )
+        cfg = json.loads((self.framework / "deploy.json").read_text())
+        cfg["ignored_directories"] = ["retire_skills", "archive"]
+        (self.framework / "deploy.json").write_text(json.dumps(cfg))
         skills, _ = cli.discover_skills()
         self.assertNotIn("old-skill", skills)
         self.assertNotIn("agent-state", skills)
@@ -105,13 +108,36 @@ class SkillLibrarianTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(link))
         self.assertTrue(self.geometry.exists())
 
-    def test_user_mount(self):
+    def test_user_mount_defaults_to_codex_for_backward_compatibility(self):
         self.assertEqual(cli.mount("reconstruction-geometry", user=True), 0)
         link = self.root / "user-skills" / "reconstruction-geometry"
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), self.geometry.resolve())
+        self.assertFalse((self.root / "claude-user-skills" / "reconstruction-geometry").exists())
 
-    def test_mount_refuses_real_directory(self):
+    def test_claude_code_runtime_adapter_user_and_project(self):
+        self.assertEqual(
+            cli.mount("reconstruction-geometry", user=True, agents=["claude-code"]),
+            0,
+        )
+        user_link = self.root / "claude-user-skills" / "reconstruction-geometry"
+        self.assertTrue(user_link.is_symlink())
+        self.assertEqual(user_link.resolve(), self.geometry.resolve())
+
+        self.assertEqual(
+            cli.mount("reconstruction-geometry", project=str(self.repo), agents=["claude"]),
+            0,
+        )
+        project_link = self.repo / ".claude" / "skills" / "reconstruction-geometry"
+        self.assertTrue(project_link.is_symlink())
+        self.assertEqual(project_link.resolve(), self.geometry.resolve())
+
+    def test_agent_all_mounts_to_both_runtime_user_scopes(self):
+        self.assertEqual(cli.mount("reconstruction-geometry", user=True, agents=["all"]), 0)
+        self.assertTrue((self.root / "user-skills" / "reconstruction-geometry").is_symlink())
+        self.assertTrue((self.root / "claude-user-skills" / "reconstruction-geometry").is_symlink())
+
+    def test_mount_refuses_unmanaged_real_directory(self):
         target = self.repo / ".agents" / "skills" / "reconstruction-geometry"
         target.mkdir(parents=True)
         with self.assertRaises(cli.LibrarianError):
@@ -119,14 +145,22 @@ class SkillLibrarianTests(unittest.TestCase):
         self.assertTrue(target.is_dir())
         self.assertFalse(target.is_symlink())
 
-    def test_unmount_refuses_real_directory(self):
+    def test_multi_runtime_mount_preflight_avoids_partial_changes(self):
+        blocked = self.root / "claude-user-skills" / "reconstruction-geometry"
+        blocked.mkdir(parents=True)
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", user=True, agents=["codex", "claude-code"])
+        self.assertFalse(os.path.lexists(self.root / "user-skills" / "reconstruction-geometry"))
+        self.assertTrue(blocked.is_dir())
+
+    def test_unmount_refuses_unmanaged_real_directory(self):
         target = self.repo / ".agents" / "skills" / "reconstruction-geometry"
         target.mkdir(parents=True)
         with self.assertRaises(cli.LibrarianError):
             cli.unmount("reconstruction-geometry", project=str(self.repo))
         self.assertTrue(target.exists())
 
-    def test_doctor_detects_duplicate_user_and_project_mount(self):
+    def test_doctor_detects_duplicate_user_and_project_mount_per_runtime(self):
         cli.mount("reconstruction-geometry", user=True)
         cli.mount("reconstruction-geometry", project=str(self.repo))
         cwd = os.getcwd()
@@ -136,6 +170,10 @@ class SkillLibrarianTests(unittest.TestCase):
         finally:
             os.chdir(cwd)
         self.assertEqual(rc, 1)
+
+    def test_same_skill_in_different_runtimes_is_not_duplicate(self):
+        cli.mount("reconstruction-geometry", user=True, agents=["all"])
+        self.assertEqual(cli.doctor(user=True, agents=["all"]), 0)
 
     def test_doctor_detects_tracked_project_mount(self):
         cli.mount("reconstruction-geometry", project=str(self.repo))
@@ -151,10 +189,64 @@ class SkillLibrarianTests(unittest.TestCase):
         target_dir.mkdir(parents=True)
         os.symlink(self.retired_agent.resolve(), target_dir / "agent-state")
         self.assertEqual(cli.doctor(project=str(self.repo)), 1)
+        status, _ = cli.describe_entry(target_dir / "agent-state", cli.discover_skills()[0])
+        self.assertEqual(status, cli.STATUS_RETIRED)
 
     def test_doctor_healthy_for_nested_project_mount(self):
         cli.mount("reconstruction-geometry", project=str(self.repo))
         self.assertEqual(cli.doctor(project=str(self.repo)), 0)
+
+    def test_doctor_detects_unmanaged_real_directory(self):
+        unmanaged = self.root / "user-skills" / "downloaded-by-codex"
+        unmanaged.mkdir(parents=True)
+        (unmanaged / "SKILL.md").write_text("---\nname: downloaded-by-codex\n---\n")
+        self.assertEqual(cli.doctor(user=True), 1)
+        status, _ = cli.describe_entry(unmanaged, cli.discover_skills()[0])
+        self.assertEqual(status, cli.STATUS_UNMANAGED)
+
+    def test_doctor_detects_external_symlink_as_unmanaged(self):
+        external = self.root / "external-skill"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: external-skill\n---\n")
+        target = self.root / "user-skills"
+        target.mkdir()
+        os.symlink(external, target / "external-skill")
+        self.assertEqual(cli.doctor(user=True), 1)
+        status, _ = cli.describe_entry(target / "external-skill", cli.discover_skills()[0])
+        self.assertEqual(status, cli.STATUS_UNMANAGED)
+
+    def test_missing_canonical_source_has_specific_status(self):
+        missing = self.group / "gone-skill"
+        target = self.root / "user-skills"
+        target.mkdir()
+        os.symlink(missing, target / "gone-skill")
+        status, resolved = cli.describe_entry(target / "gone-skill", cli.discover_skills()[0])
+        self.assertEqual(status, cli.STATUS_MISSING_SOURCE)
+        self.assertEqual(resolved, missing.resolve())
+        self.assertEqual(cli.doctor(user=True), 1)
+
+    def test_list_json_is_stable_machine_readable_shape(self):
+        cli.mount("reconstruction-geometry", user=True, agents=["all"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.list_mounts(user=True, agents=["all"], json_output=True)
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(len(payload["mounts"]), 2)
+        self.assertEqual({row["runtime"] for row in payload["mounts"]}, {"codex", "claude-code"})
+        self.assertEqual({row["status"] for row in payload["mounts"]}, {cli.STATUS_MANAGED})
+        for row in payload["mounts"]:
+            self.assertEqual(
+                set(row),
+                {"runtime", "scope", "name", "status", "path", "target"},
+            )
+
+    def test_disabled_runtime_is_rejected_when_selected(self):
+        cfg = json.loads((self.framework / "deploy.json").read_text())
+        cfg["runtimes"]["claude-code"]["enabled"] = False
+        (self.framework / "deploy.json").write_text(json.dumps(cfg))
+        with self.assertRaises(cli.LibrarianError):
+            cli.mount("reconstruction-geometry", user=True, agents=["claude-code"])
 
 
 if __name__ == "__main__":
