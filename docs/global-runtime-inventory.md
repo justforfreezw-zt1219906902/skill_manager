@@ -26,7 +26,7 @@ The registry is machine-local and is stored at:
 
 Only Git repository roots can be added. Passing a subdirectory inside a Git repository normalizes to that repository's root. The registry stores absolute paths and never scans the whole home directory for projects.
 
-New successful project-scoped `mount` and `adopt` operations automatically register their Git root. Project mounts created before this feature need a one-time migration:
+New successful project-scoped `mount` and `adopt` operations automatically register their Git root. Successful `vendor` creation does the same. Project mounts created before this feature need a one-time migration:
 
 ```bash
 cd /path/to/existing/project
@@ -49,8 +49,19 @@ This inspects the selected runtime's user scope plus the project scope for every
 ```text
 RUNTIME       SCOPE    PROJECT                              SKILL                     STATUS           TARGET
 codex         user     -                                    using-agent-skills        MANAGED          ~/.agents/skills/...
-codex         project  ~/PycharmProjects/reconstruction     reconstruction-geometry   MANAGED          ~/ai_general_tools/...
+codex         project  ~/PycharmProjects/reconstruction     reconstruction-geometry   VENDORED         ~/PycharmProjects/reconstruction/.agents/skills/reconstruction-geometry
 ```
+
+`MANAGED` means the runtime entry is a managed link to a canonical skill. `VENDORED` means the project entry is a physical skill directory with valid `.skill-vendor.json` ownership metadata. Other runtime conditions such as `UNMANAGED`, `BROKEN_LINK`, `WRONG_LINK`, `RETIRED`, and `MISSING_SOURCE` keep their existing meanings.
+
+The global view intentionally reports a vendored snapshot simply as `VENDORED`. To inspect whether its canonical source or project copy has changed since vendoring, use:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  vendor status reconstruction-geometry --project /path/to/repo
+```
+
+See `docs/vendor-skills.md` for the vendored lifecycle and update/remove safety rules.
 
 The default runtime remains Codex for backward compatibility. Inspect every enabled runtime with:
 
@@ -69,4 +80,4 @@ Stale registered projects do not make the whole inventory fail. Missing or non-G
 
 ## Command routing
 
-`skill-librarian/scripts/skill_librarian.py` is now the single routing authority. `bin/skill-librarian` is only a thin executable launcher for that Python entrypoint, so the two invocation styles expose the same command surface and behavior.
+`skill-librarian/scripts/skill_librarian.py` is the single routing authority. `bin/skill-librarian` is only a thin executable launcher for that Python entrypoint, so the two invocation styles expose the same command surface and behavior.
