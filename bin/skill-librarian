@@ -5,6 +5,15 @@ import runpy
 import sys
 
 repo_root = Path(__file__).resolve().parents[1]
-script = repo_root / "skill-librarian" / "scripts" / "skill_librarian.py"
+core_script = repo_root / "skill-librarian" / "scripts" / "skill_librarian.py"
+inventory_script = repo_root / "skill-librarian" / "scripts" / "project_inventory.py"
+
+args = sys.argv[1:]
+use_inventory = bool(args) and (
+    args[0] in {"projects", "project"}
+    or (args[0] == "list" and "--global" in args[1:])
+)
+
+script = inventory_script if use_inventory else core_script
 sys.argv[0] = str(script)
 runpy.run_path(str(script), run_name="__main__")
