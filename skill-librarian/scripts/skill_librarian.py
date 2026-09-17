@@ -28,6 +28,19 @@ FRAMEWORK_ROOT = SKILL_DIR.parent
 _CORE_MAIN = main
 
 
+class _ControlFacade:
+    """Expose this module's live globals without depending on sys.modules registration."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+_CONTROL_API = _ControlFacade()
+
+
 def _load_vendor_module():
     module_path = SCRIPT_PATH.with_name("skill_vendor.py")
     spec = importlib.util.spec_from_file_location("skill_librarian_vendor", module_path)
@@ -93,7 +106,7 @@ def main(argv=None):
     if argv and argv[0] == "vendor":
         return _load_vendor_module().main(
             argv[1:],
-            control=sys.modules[__name__],
+            control=_CONTROL_API,
             register_project=_register_project,
         )
 
