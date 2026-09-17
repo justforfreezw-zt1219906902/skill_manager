@@ -31,6 +31,7 @@ jobs:
       - name: Compile CLI
         run: |
           python -m py_compile skill-librarian/scripts/skill_librarian.py
+          python -m py_compile skill-librarian/scripts/skill_librarian_core.py
           python -m py_compile skill-librarian/scripts/project_inventory.py
 
       - name: Run unit tests
