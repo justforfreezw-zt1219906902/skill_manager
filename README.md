@@ -334,6 +334,44 @@ Current status values are:
 
 This is intentionally strict: a skill installed directly by Codex, Claude Code, `npx skills`, or another tool remains **unmanaged** until you explicitly run `adopt` or remove it.
 
+## Vendored project skills
+
+Use `vendor` when a project should carry a physical skill snapshot instead of a machine-local link to the canonical library. This is useful for team repositories, CI, containers, remote agents, or project-specific pinned skill versions.
+
+Create a project-owned snapshot:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  vendor reconstruction-geometry --project /path/to/repo --agent codex
+```
+
+Inspect whether the project copy or canonical source changed:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  vendor status reconstruction-geometry --project /path/to/repo --agent codex
+```
+
+Update from the current canonical source:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  vendor update reconstruction-geometry --project /path/to/repo --agent codex
+```
+
+Remove the vendored copy:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py \
+  vendor remove reconstruction-geometry --project /path/to/repo --agent codex
+```
+
+A vendored directory contains `.skill-vendor.json` with its baseline content fingerprint and source identity. `vendor status` reports `SAME`, `SOURCE_CHANGED`, `LOCAL_MODIFIED`, `DIVERGED`, `SOURCE_MISSING`, or `SOURCE_MISSING_LOCAL_MODIFIED`. Update/remove refuse destructive changes when the project copy was locally modified unless `--force` is explicit.
+
+Successful vendor creation registers the project automatically. Vendored copies are designed to be committed with the project, unlike project mounts whose absolute local links are normally machine-specific.
+
+See `docs/vendor-skills.md` for the lifecycle and safety model.
+
 ## Global runtime inventory
 
 `--global` is an aggregate inventory view, not a third scope. It combines runtime user scope with every explicitly registered project scope.
@@ -362,13 +400,15 @@ python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py projec
 
 For example, if `reconstruction-geometry` is already mounted in that project's `.agents/skills/`, registering the project is enough; do not remount the skill.
 
-Then the global view can show both scopes together:
+Then the global view can show user mounts, project mounts, and vendored copies together:
 
 ```text
 RUNTIME       SCOPE    PROJECT                     SKILL                    STATUS
 codex         user     -                           using-agent-skills       MANAGED
-codex         project  ~/path/to/project           reconstruction-geometry MANAGED
+codex         project  ~/path/to/project           reconstruction-geometry VENDORED
 ```
+
+`VENDORED` is a global-inventory classification for a real project directory with valid `.skill-vendor.json` ownership metadata. A normal real runtime directory without valid vendor metadata remains `UNMANAGED`. Use `vendor status` for detailed vendored drift state.
 
 The registry is machine-local at `~/.config/skill-librarian/projects.json` on macOS/Linux by default (or under `$XDG_CONFIG_HOME` when configured). It stores explicit Git roots and never recursively scans the whole home directory. Use `--agent all` to inspect all enabled runtimes and `--json` for machine-readable output.
 
@@ -403,10 +443,12 @@ The same skill mounted into Codex and Claude Code is expected and is **not** tre
 - `import` creates a canonical asset only; runtime activation remains a separate `mount` decision.
 - `import` never overwrites an existing canonical skill and records sanitized provenance for later diff/update work.
 - `adopt` and `import` reject path traversal, hidden/ignored destination categories, and non-portable internal links.
+- `vendor` creates a real project-owned snapshot and never replaces an existing runtime entry automatically.
+- `vendor update` and `vendor remove` protect local project modifications unless `--force` is explicit.
 - An existing wrong link is repaired only with `--force`.
 - Skills below ignored directories such as `retire_skills` are not available for mounting.
 - `doctor` fails when a runtime still points into an ignored/retired source subtree.
-- Project mounts use absolute local links and are normally **not committed** to the project repository.
+- Project mounts use absolute local links and are normally **not committed** to the project repository; vendored copies are intentionally suitable for Git.
 - Avoid mounting the same skill at both user and project scope for one runtime.
 
 ## Legacy bulk deployment
@@ -436,11 +478,11 @@ personal-agent-skills/                     # Git source of truth
 skill_manager/                             # control plane
 ~/.agents/skills/                          # Codex user links only
 ~/.claude/skills/                          # Claude Code user links only
-<repo>/.agents/skills/                     # Codex project links only
-<repo>/.claude/skills/                     # Claude Code project links only
+<repo>/.agents/skills/                     # Codex project links or vendored copies
+<repo>/.claude/skills/                     # Claude Code project links or vendored copies
 ```
 
-That keeps **what the skill is and where it came from** in Git while runtime directories express only **where an active skill is mounted**.
+That keeps **what the skill is and where it came from** in Git while runtime directories express where an active skill is mounted or vendored for project ownership.
 
 ## Roadmap
 
@@ -450,4 +492,5 @@ v0.4  adopt unmanaged runtime skills into the canonical library
 v0.5  import external skills + provenance metadata
 v0.6  upstream diff / update using provenance
 v0.7  registered-project global runtime inventory
+v0.8  vendored project skill lifecycle
 ```
