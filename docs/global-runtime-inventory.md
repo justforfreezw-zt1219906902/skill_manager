@@ -4,10 +4,17 @@
 
 ## Register projects
 
+Both supported entrypoints expose the same commands:
+
 ```bash
-skill-librarian project add /absolute/path/to/repo
-skill-librarian projects
-skill-librarian project remove /absolute/path/to/repo
+./bin/skill-librarian project add /absolute/path/to/repo
+python3 skill-librarian/scripts/skill_librarian.py project add /absolute/path/to/repo
+
+./bin/skill-librarian projects
+python3 skill-librarian/scripts/skill_librarian.py projects
+
+./bin/skill-librarian project remove /absolute/path/to/repo
+python3 skill-librarian/scripts/skill_librarian.py project remove /absolute/path/to/repo
 ```
 
 The registry is machine-local and is stored at:
@@ -19,10 +26,22 @@ The registry is machine-local and is stored at:
 
 Only Git repository roots can be added. Passing a subdirectory inside a Git repository normalizes to that repository's root. The registry stores absolute paths and never scans the whole home directory for projects.
 
-## Global inventory
+New successful project-scoped `mount` and `adopt` operations automatically register their Git root. Project mounts created before this feature need a one-time migration:
 
 ```bash
-skill-librarian list --global
+cd /path/to/existing/project
+python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py project add .
+```
+
+For example, an existing project that already has `reconstruction-geometry` mounted at project scope only needs this one registration step; the mount itself does not need to be recreated.
+
+## Global inventory
+
+Both entrypoints are equivalent:
+
+```bash
+./bin/skill-librarian list --global
+python3 skill-librarian/scripts/skill_librarian.py list --global
 ```
 
 This inspects the selected runtime's user scope plus the project scope for every registered project and adds a `PROJECT` column:
@@ -36,18 +55,18 @@ codex         project  ~/PycharmProjects/reconstruction     reconstruction-geome
 The default runtime remains Codex for backward compatibility. Inspect every enabled runtime with:
 
 ```bash
-skill-librarian list --global --agent all
+python3 skill-librarian/scripts/skill_librarian.py list --global --agent all
 ```
 
 Machine-readable output is available with:
 
 ```bash
-skill-librarian list --global --json
-skill-librarian projects --json
+python3 skill-librarian/scripts/skill_librarian.py list --global --json
+python3 skill-librarian/scripts/skill_librarian.py projects --json
 ```
 
 Stale registered projects do not make the whole inventory fail. Missing or non-Git entries are skipped and reported as notes; remove them with `skill-librarian project remove PATH` when they are no longer needed.
 
 ## Command routing
 
-The global inventory commands are exposed through the repository entrypoint `bin/skill-librarian`. Existing commands continue to delegate to `skill-librarian/scripts/skill_librarian.py` unchanged.
+`skill-librarian/scripts/skill_librarian.py` is now the single routing authority. `bin/skill-librarian` is only a thin executable launcher for that Python entrypoint, so the two invocation styles expose the same command surface and behavior.

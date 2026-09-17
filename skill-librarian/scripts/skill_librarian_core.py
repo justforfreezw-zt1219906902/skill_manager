@@ -1,0 +1,1416 @@
+#!/usr/bin/env python3
+"""
+Manage portable agent skills and link them into Codex, Claude Code, and project scopes.
+
+The source skill library remains the source of truth. Runtime directories contain
+links, not copies, so edits or git pulls in the library propagate immediately.
+
+Configured library roots may contain skills directly or inside grouping folders.
+Discovery recurses until it reaches a directory containing SKILL.md, then treats
+that directory as a skill boundary. Directories named by ignored_directories are
+not scanned; retire_skills is ignored by default.
+
+Scoped commands:
+
+    skill-librarian available
+    skill-librarian mount NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian unmount NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian adopt NAME [--user | --project REPO] [-a RUNTIME]
+    skill-librarian import SOURCE --skill NAME [--ref REF]
+    skill-librarian list [--user | --project REPO] [-a RUNTIME] [--json]
+    skill-librarian doctor [--user | --project REPO] [-a RUNTIME]
+
+Runtime defaults preserve the v0.2 behavior: scoped commands target Codex unless
+--agent is supplied. Repeat --agent to target more than one runtime, or use
+--agent all. Built-in adapters are codex and claude-code. adopt is intentionally
+single-runtime because it takes ownership of one concrete runtime entry. import
+creates a canonical asset only and never mounts it into a runtime.
+
+For mount/unmount/adopt, omitting a scope means the current Git repository.
+For list/doctor, omitting a scope inspects user scope plus the current Git
+repository when one is available.
+
+The script also keeps the old bulk-deploy interface used by deploy.py:
+
+    python3 deploy.py
+    python3 deploy.py --dry-run
+    python3 deploy.py --skill NAME
+
+Requires Python 3. Standard library only. Git-backed imports also require Git.
+"""
+
+import argparse
+import importlib.util
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+SCRIPT_PATH = Path(__file__).resolve()
+SKILL_DIR = SCRIPT_PATH.parent.parent
+FRAMEWORK_ROOT = SKILL_DIR.parent
+DEFAULT_TARGETS = ["~/.claude/skills", "~/.agents/skills"]
+DEFAULT_IGNORED_DIRECTORIES = ("retire_skills",)
+DEFAULT_RUNTIME = "codex"
+DEFAULT_ADOPT_CATEGORY = "imported"
+SCOPED_COMMANDS = {"mount", "unmount", "adopt", "list", "available", "doctor"}
+
+STATUS_MANAGED = "MANAGED"
+STATUS_UNMANAGED = "UNMANAGED"
+STATUS_BROKEN_LINK = "BROKEN_LINK"
+STATUS_WRONG_LINK = "WRONG_LINK"
+STATUS_RETIRED = "RETIRED"
+STATUS_MISSING_SOURCE = "MISSING_SOURCE"
+
+RUNTIME_CONFIG_KEYS = {"enabled", "user_target", "project_target"}
+
+
+class LibrarianError(RuntimeError):
+    pass
+
+
+class RuntimeAdapter:
+    """Resolve runtime-specific user and project skill directories."""
+
+    def __init__(self, name, default_user_target, project_relative, aliases=()):
+        self.name = name
+        self.default_user_target = default_user_target
+        self.project_relative = Path(project_relative)
+        self.aliases = tuple(aliases)
+
+    def runtime_config(self):
+        runtimes = runtime_config_root()
+        raw = runtimes.get(self.name, {})
+        if raw is False:
+            return {"enabled": False}
+        if raw is True or raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise LibrarianError(f"runtimes.{self.name} must be a JSON object or boolean")
+
+        unknown = sorted(set(raw) - RUNTIME_CONFIG_KEYS)
+        if unknown:
+            raise LibrarianError(
+                f"runtimes.{self.name} has unknown key(s): {', '.join(unknown)}"
+            )
+        if "enabled" in raw and not isinstance(raw["enabled"], bool):
+            raise LibrarianError(f"runtimes.{self.name}.enabled must be a boolean")
+        if "user_target" in raw:
+            absolute_config_path(raw["user_target"], f"runtimes.{self.name}.user_target")
+        if "project_target" in raw:
+            project_relative_config_path(
+                raw["project_target"], f"runtimes.{self.name}.project_target"
+            )
+        return raw
+
+    def is_enabled(self):
+        return self.runtime_config().get("enabled", True) is not False
+
+    def user_target(self):
+        runtime_cfg = self.runtime_config()
+        explicit = runtime_cfg.get("user_target")
+        if explicit:
+            return absolute_config_path(explicit, f"runtimes.{self.name}.user_target")
+
+        # Backward compatibility: v0.2 used top-level user_target only for Codex.
+        if self.name == "codex":
+            cfg = config()
+            explicit = cfg.get("user_target")
+            if explicit:
+                return absolute_config_path(explicit, "user_target")
+            for target in cfg.get("targets", []):
+                expanded = absolute_config_path(target, "targets[]")
+                if expanded.as_posix().rstrip("/").endswith("/.agents/skills"):
+                    return expanded
+
+        return absolute_config_path(self.default_user_target, f"default {self.name} user target")
+
+    def project_target(self, path=".", required=True):
+        root = git_root(path, required=required)
+        if root is None:
+            return None
+
+        runtime_cfg = self.runtime_config()
+        relative = runtime_cfg.get("project_target")
+        candidate = (
+            project_relative_config_path(relative, f"runtimes.{self.name}.project_target")
+            if relative
+            else self.project_relative
+        )
+
+        target = (root / candidate).resolve(strict=False)
+        try:
+            relative_target = target.relative_to(root)
+        except ValueError as exc:
+            raise LibrarianError(
+                f"runtimes.{self.name}.project_target resolves outside the Git root: {target}"
+            ) from exc
+        if not relative_target.parts:
+            raise LibrarianError(
+                f"runtimes.{self.name}.project_target must be a subdirectory of the Git root"
+            )
+        return target
+
+
+RUNTIME_ADAPTERS = {
+    "codex": RuntimeAdapter(
+        "codex",
+        "~/.agents/skills",
+        ".agents/skills",
+    ),
+    "claude-code": RuntimeAdapter(
+        "claude-code",
+        "~/.claude/skills",
+        ".claude/skills",
+        aliases=("claude",),
+    ),
+}
+
+RUNTIME_ALIASES = {
+    alias: name
+    for name, adapter in RUNTIME_ADAPTERS.items()
+    for alias in adapter.aliases
+}
+
+
+def _read_json(path):
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise LibrarianError(f"Cannot read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise LibrarianError(f"Configuration must be a JSON object: {path}")
+    return value
+
+
+def config():
+    return _read_json(FRAMEWORK_ROOT / "deploy.json")
+
+
+def local_skill_config():
+    return _read_json(SKILL_DIR / "config.json")
+
+
+def runtime_config_root():
+    raw = config().get("runtimes", {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise LibrarianError("runtimes must be a JSON object")
+    unknown = sorted(set(raw) - set(RUNTIME_ADAPTERS))
+    if unknown:
+        raise LibrarianError(f"Unknown runtime configuration key(s): {', '.join(unknown)}")
+    return raw
+
+
+def absolute_config_path(raw, label):
+    if not isinstance(raw, str) or not raw.strip():
+        raise LibrarianError(f"{label} must be a non-empty absolute path string")
+    candidate = Path(os.path.expanduser(raw.strip()))
+    if not candidate.is_absolute():
+        raise LibrarianError(f"{label} must be an absolute path (or start with ~): {raw}")
+    return candidate.resolve(strict=False)
+
+
+def project_relative_config_path(raw, label):
+    if not isinstance(raw, str) or not raw.strip():
+        raise LibrarianError(f"{label} must be a non-empty relative path string")
+    candidate = Path(raw.strip())
+    if candidate.is_absolute():
+        raise LibrarianError(f"{label} must be relative to the Git root")
+    if candidate == Path(".") or any(part == ".." for part in candidate.parts):
+        raise LibrarianError(f"{label} must stay inside a subdirectory of the Git root")
+    return candidate
+
+
+def short(path):
+    path = str(path)
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def ignored_directory_names():
+    """Return directory basenames that recursive skill discovery must prune."""
+    cfg = config()
+    local_cfg = local_skill_config()
+    raw = cfg.get("ignored_directories")
+    if raw is None:
+        raw = local_cfg.get("ignored_directories")
+    if raw is None:
+        raw = list(DEFAULT_IGNORED_DIRECTORIES)
+    if not isinstance(raw, list) or any(not isinstance(name, str) or not name.strip() for name in raw):
+        raise LibrarianError("ignored_directories must be a JSON list of non-empty directory names")
+    return {name.strip() for name in raw}
+
+
+def configured_library_roots(include_missing=False):
+    roots = [FRAMEWORK_ROOT]
+    raw_libraries = config().get("libraries", [])
+    if not isinstance(raw_libraries, list):
+        raise LibrarianError("libraries must be a JSON list of absolute path strings")
+    for raw in raw_libraries:
+        roots.append(absolute_config_path(raw, "libraries[]"))
+
+    # A standalone/deployed skill may not have the framework-level deploy.json.
+    # Reuse its existing migration config as a fallback library declaration.
+    library = local_skill_config().get("skill_library_path")
+    if library:
+        roots.append(absolute_config_path(library, "skill_library_path"))
+
+    seen = set()
+    out = []
+    for root in roots:
+        root = root.resolve(strict=False)
+        if root in seen:
+            continue
+        seen.add(root)
+        if root.is_dir() or include_missing:
+            out.append(root)
+    return out
+
+
+def iter_skill_dirs(root):
+    """Yield lexical skill folders below root in deterministic relative-path order."""
+    root = Path(root).resolve()
+    ignored = ignored_directory_names()
+    found = []
+
+    def walk(directory):
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            raise LibrarianError(f"Cannot scan skill library directory {directory}: {exc}") from exc
+        for child in children:
+            if child.name.startswith(".") or child.name in ignored or not child.is_dir():
+                continue
+            if (child / "SKILL.md").is_file():
+                found.append(child)
+                continue
+            # Do not recurse through grouping-directory symlinks. A symlink that is itself
+            # a skill is still accepted above for backward compatibility.
+            if child.is_symlink():
+                continue
+            walk(child)
+
+    walk(root)
+    found.sort(key=lambda p: p.relative_to(root).as_posix())
+    return found
+
+
+def discover_skills():
+    """Return skill-name -> canonical source folder. First library wins."""
+    found = {}
+    clashes = []
+    for root in configured_library_roots():
+        for child in iter_skill_dirs(root):
+            name = child.name
+            resolved = child.resolve()
+            if name in found:
+                clashes.append((name, found[name], resolved))
+                continue
+            found[name] = resolved
+    return found, clashes
+
+
+def git_root(path=".", required=True):
+    candidate = Path(path).expanduser().resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return Path(proc.stdout.strip()).resolve()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        if required:
+            raise LibrarianError(f"Not inside a Git repository: {candidate}")
+        return None
+
+
+def normalize_runtime_name(name):
+    name = name.strip().lower()
+    return RUNTIME_ALIASES.get(name, name)
+
+
+def runtime_adapters(agents=None):
+    """Resolve CLI agent selectors to distinct built-in runtime adapters."""
+    # Validate the complete runtime config even if only one adapter is selected so
+    # typos cannot sit silently in deploy.json.
+    runtime_config_root()
+
+    requested = list(agents or [DEFAULT_RUNTIME])
+    if not requested:
+        requested = [DEFAULT_RUNTIME]
+
+    normalized = [normalize_runtime_name(value) for value in requested]
+    if "all" in normalized:
+        if len(normalized) > 1:
+            raise LibrarianError("--agent all cannot be combined with other --agent values")
+        names = [name for name, adapter in RUNTIME_ADAPTERS.items() if adapter.is_enabled()]
+        if not names:
+            raise LibrarianError("--agent all selected no enabled runtimes")
+    else:
+        names = normalized
+
+    result = []
+    seen = set()
+    for name in names:
+        adapter = RUNTIME_ADAPTERS.get(name)
+        if adapter is None:
+            available = ", ".join(sorted(RUNTIME_ADAPTERS))
+            raise LibrarianError(f"Unknown runtime '{name}'. Available: {available}, all")
+        if not adapter.is_enabled():
+            raise LibrarianError(f"Runtime '{name}' is disabled in deploy.json")
+        if name not in seen:
+            seen.add(name)
+            result.append(adapter)
+    return result
+
+
+def user_target():
+    """Backward-compatible Codex user target accessor."""
+    return RUNTIME_ADAPTERS["codex"].user_target()
+
+
+def project_target(path="."):
+    """Backward-compatible Codex project target accessor."""
+    return RUNTIME_ADAPTERS["codex"].project_target(path)
+
+
+def target_identity(path):
+    """Return a normalized physical identity for target-collision checks."""
+    try:
+        return Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(path))
+
+
+def ensure_distinct_targets(targets):
+    """Reject two selected runtime/scope labels that resolve to the same directory."""
+    seen = {}
+    for runtime, scope, path in targets:
+        identity = target_identity(path)
+        previous = seen.get(identity)
+        if previous is not None and previous != (runtime, scope):
+            prev_runtime, prev_scope = previous
+            raise LibrarianError(
+                "Runtime target collision: "
+                f"{prev_runtime}:{prev_scope} and {runtime}:{scope} both resolve to {short(identity)}"
+            )
+        seen[identity] = (runtime, scope)
+
+
+def link_target(path):
+    """Return resolved target for a symlink/junction, otherwise None."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return None
+    if path.is_symlink():
+        return Path(os.path.realpath(path)).resolve(strict=False)
+    if os.name == "nt":
+        try:
+            attrs = os.lstat(path).st_file_attributes
+            if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                # Broken junctions are reparse points even when path.is_dir() is false.
+                return Path(os.path.realpath(path)).resolve(strict=False)
+        except (AttributeError, OSError):
+            pass
+    return None
+
+
+def remove_link(path):
+    path = Path(path)
+    if os.name == "nt":
+        try:
+            os.rmdir(path)
+        except OSError:
+            os.unlink(path)
+    else:
+        path.unlink()
+
+
+def remove_any_path(path):
+    """Remove one path without following links. Used only for adopt-owned temp/backup paths."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or link_target(path) is not None:
+        remove_link(path)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def make_link(src, link):
+    src = Path(src).resolve()
+    link = Path(link)
+    if os.name == "nt":
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(src), str(link))
+        except (ImportError, AttributeError, OSError):
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(src)],
+                check=True,
+                capture_output=True,
+            )
+    else:
+        os.symlink(src, link)
+
+
+def resolve_scope(adapter, user=False, project=None, default_project=True):
+    if user and project is not None:
+        raise LibrarianError("Choose only one scope: --user or --project REPO")
+    if user:
+        return "user", adapter.user_target()
+    if project is not None:
+        return "project", adapter.project_target(project)
+    if default_project:
+        return "project", adapter.project_target(".")
+    return None, None
+
+
+def _mount_plan(skill, source, adapters, user=False, project=None, force=False):
+    scopes = []
+    for adapter in adapters:
+        scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        scopes.append((adapter, scope, target_dir))
+
+    ensure_distinct_targets(
+        [(adapter.name, scope, target_dir) for adapter, scope, target_dir in scopes]
+    )
+
+    plan = []
+    for adapter, scope, target_dir in scopes:
+        link = target_dir / skill
+        current = link_target(link)
+        action = "mount"
+        if current == source:
+            action = "ok"
+        elif os.path.lexists(link):
+            if current is None:
+                raise LibrarianError(
+                    f"Refusing to replace unmanaged real path {short(link)} for {adapter.name}. "
+                    "Adopt or move it manually first."
+                )
+            if not force:
+                raise LibrarianError(
+                    f"{short(link)} for {adapter.name} points to {short(current)}, not {short(source)}. "
+                    "Use --force only if you intend to repair that link."
+                )
+            action = "repair"
+        plan.append((adapter, scope, target_dir, link, current, action))
+    return plan
+
+
+def mount(skill, user=False, project=None, dry_run=False, force=False, agents=None):
+    skills, _ = discover_skills()
+    if skill not in skills:
+        available_names = ", ".join(sorted(skills)) or "(none)"
+        raise LibrarianError(f"Unknown skill '{skill}'. Available: {available_names}")
+
+    source = skills[skill]
+    adapters = runtime_adapters(agents)
+    plan = _mount_plan(skill, source, adapters, user=user, project=project, force=force)
+
+    for adapter, scope, target_dir, link, current, action in plan:
+        label = f"{adapter.name}:{scope}"
+        if action == "ok":
+            print(f"OK       {skill} already mounted [{label}]: {short(link)}")
+            continue
+        if dry_run:
+            verb = "REPAIR" if action == "repair" else "MOUNT"
+            print(f"{verb:8} {skill} [{label}] {short(link)} -> {short(source)}")
+            continue
+        if action == "repair":
+            remove_link(link)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        make_link(source, link)
+        verb = "REPAIRED" if action == "repair" else "MOUNTED"
+        print(f"{verb:8} {skill} [{label}] {short(link)} -> {short(source)}")
+    return 0
+
+
+def unmount(skill, user=False, project=None, dry_run=False, agents=None):
+    adapters = runtime_adapters(agents)
+    scopes = []
+    for adapter in adapters:
+        scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+        scopes.append((adapter, scope, target_dir))
+
+    ensure_distinct_targets(
+        [(adapter.name, scope, target_dir) for adapter, scope, target_dir in scopes]
+    )
+
+    plan = []
+    for adapter, scope, target_dir in scopes:
+        link = target_dir / skill
+        if not os.path.lexists(link):
+            plan.append((adapter, scope, link, None, "missing"))
+            continue
+        current = link_target(link)
+        if current is None:
+            raise LibrarianError(
+                f"Refusing to delete unmanaged real path {short(link)} for {adapter.name}. "
+                "unmount removes links only."
+            )
+        plan.append((adapter, scope, link, current, "remove"))
+
+    for adapter, scope, link, current, action in plan:
+        label = f"{adapter.name}:{scope}"
+        if action == "missing":
+            print(f"OK       {skill} is not mounted [{label}]: {short(link)}")
+            continue
+        if dry_run:
+            print(f"UNMOUNT  {skill} [{label}] {short(link)}")
+            continue
+        remove_link(link)
+        print(f"UNMOUNTED {skill} [{label}] {short(link)}")
+    return 0
+
+
+def _relative_to_library(path):
+    """Return (root, relative) when path is lexically below a configured library."""
+    candidate = Path(path)
+    try:
+        candidate = candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        candidate = Path(os.path.abspath(candidate))
+    for root in configured_library_roots(include_missing=True):
+        root = root.resolve(strict=False)
+        try:
+            return root, candidate.relative_to(root)
+        except ValueError:
+            continue
+    return None, None
+
+
+def is_ignored_library_source(path):
+    """Return True when path is inside an ignored subtree of a configured library."""
+    root, relative = _relative_to_library(path)
+    if root is None:
+        return False
+    ignored = ignored_directory_names()
+    return any(part in ignored for part in relative.parts)
+
+
+def is_managed_library_path(path):
+    root, relative = _relative_to_library(path)
+    return root is not None and not any(part in ignored_directory_names() for part in relative.parts)
+
+
+def describe_entry(entry, known_sources):
+    """Classify one runtime entry against the canonical source libraries."""
+    entry = Path(entry)
+    current = link_target(entry)
+    if current is not None:
+        expected = known_sources.get(entry.name)
+        if not entry.exists():
+            if is_ignored_library_source(current):
+                return STATUS_RETIRED, current
+            if is_managed_library_path(current):
+                return STATUS_MISSING_SOURCE, current
+            return STATUS_BROKEN_LINK, current
+        if expected == current:
+            return STATUS_MANAGED, current
+        if expected is not None:
+            return STATUS_WRONG_LINK, current
+        if is_ignored_library_source(current):
+            return STATUS_RETIRED, current
+        # An externally created link is still unmanaged from skill-librarian's point of view.
+        return STATUS_UNMANAGED, current
+
+    if os.path.lexists(entry):
+        try:
+            return STATUS_UNMANAGED, entry.resolve()
+        except OSError:
+            return STATUS_UNMANAGED, entry
+    return STATUS_BROKEN_LINK, entry
+
+
+def list_target(runtime, scope, target_dir, skills):
+    rows = []
+    if not target_dir.is_dir():
+        return rows
+    try:
+        entries = sorted(target_dir.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise LibrarianError(f"Cannot inspect runtime target {target_dir}: {exc}") from exc
+    for entry in entries:
+        status, resolved = describe_entry(entry, skills)
+        rows.append(
+            {
+                "runtime": runtime,
+                "scope": scope,
+                "name": entry.name,
+                "status": status,
+                "path": str(entry),
+                "target": str(resolved),
+            }
+        )
+    return rows
+
+
+def selected_targets(user=False, project=None, include_default_both=False, agents=None):
+    if user and project is not None:
+        raise LibrarianError("Choose only one scope: --user or --project REPO")
+
+    result = []
+    for adapter in runtime_adapters(agents):
+        if user:
+            result.append((adapter.name, "user", adapter.user_target()))
+            continue
+        if project is not None:
+            result.append((adapter.name, "project", adapter.project_target(project)))
+            continue
+        if include_default_both:
+            result.append((adapter.name, "user", adapter.user_target()))
+            project_dir = adapter.project_target(".", required=False)
+            if project_dir is not None:
+                result.append((adapter.name, "project", project_dir))
+            continue
+        result.append((adapter.name, "project", adapter.project_target(".")))
+
+    ensure_distinct_targets(result)
+    return result
+
+
+def collect_mount_rows(user=False, project=None, agents=None):
+    skills, _ = discover_skills()
+    rows = []
+    for runtime, scope, target in selected_targets(
+        user=user,
+        project=project,
+        include_default_both=True,
+        agents=agents,
+    ):
+        rows.extend(list_target(runtime, scope, target, skills))
+    return rows
+
+
+def list_mounts(user=False, project=None, agents=None, json_output=False):
+    rows = collect_mount_rows(user=user, project=project, agents=agents)
+
+    if json_output:
+        print(json.dumps({"mounts": rows}, indent=2, sort_keys=True))
+        return 0
+
+    if not rows:
+        print("No mounted skills found in the selected runtime/scope(s).")
+        return 0
+
+    print(f"{'RUNTIME':13} {'SCOPE':8} {'SKILL':28} {'STATUS':16} TARGET")
+    for row in rows:
+        print(
+            f"{row['runtime']:13} {row['scope']:8} {row['name']:28} "
+            f"{row['status']:16} {short(row['target'])}"
+        )
+    return 0
+
+
+def available():
+    skills, clashes = discover_skills()
+    if not skills:
+        print("No skills found in configured libraries.")
+        return 0
+    print(f"{'SKILL':28} SOURCE")
+    for name, source in sorted(skills.items()):
+        print(f"{name:28} {short(source)}")
+    if clashes:
+        print("\nName clashes (first library wins):")
+        for name, kept, ignored in clashes:
+            print(f"  {name}: kept {short(kept)}; ignored {short(ignored)}")
+    return 0
+
+
+def parse_frontmatter_name(skill_md):
+    try:
+        lines = skill_md.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:40]:
+        if line.strip() == "---":
+            break
+        if line.startswith("name:"):
+            return line.split(":", 1)[1].strip().strip('"\'')
+    return None
+
+
+def validate_adopt_skill_name(skill):
+    """Require one simple runtime basename so adopt cannot traverse outside its scope."""
+    if not isinstance(skill, str) or not skill.strip():
+        raise LibrarianError("adopt skill name must be a non-empty basename")
+    if skill != skill.strip() or skill in {".", ".."} or skill.startswith("."):
+        raise LibrarianError(f"Invalid adopt skill name: {skill!r}")
+    if "/" in skill or "\\" in skill or Path(skill).name != skill:
+        raise LibrarianError(f"adopt skill name must be a basename, not a path: {skill!r}")
+    return skill
+
+
+def configured_adopt_libraries():
+    """Return configured canonical libraries excluding the framework repo itself."""
+    framework = FRAMEWORK_ROOT.resolve(strict=False)
+    return [
+        root
+        for root in configured_library_roots(include_missing=True)
+        if root.resolve(strict=False) != framework
+    ]
+
+
+def resolve_adopt_library(raw=None):
+    """Choose one configured, existing canonical library for an adopt operation."""
+    candidates = configured_adopt_libraries()
+    if raw:
+        selected = absolute_config_path(raw, "--library")
+        if selected not in candidates:
+            configured = ", ".join(short(p) for p in candidates) or "(none)"
+            raise LibrarianError(
+                f"--library must be one of the configured canonical libraries: {configured}"
+            )
+    else:
+        existing = [path for path in candidates if path.is_dir()]
+        if not existing:
+            raise LibrarianError(
+                "No external canonical skill library is configured. Add one to deploy.json libraries "
+                "or skill_library_path before adopting."
+            )
+        if len(existing) > 1:
+            choices = ", ".join(short(p) for p in existing)
+            raise LibrarianError(
+                f"Multiple canonical libraries are configured ({choices}); choose one with --library."
+            )
+        selected = existing[0]
+
+    if not selected.is_dir():
+        raise LibrarianError(f"Adopt library does not exist: {short(selected)}")
+    return selected.resolve()
+
+
+def adopt_category_path(category):
+    if not isinstance(category, str) or not category.strip():
+        raise LibrarianError("--category must be a non-empty relative path")
+    candidate = Path(category.strip())
+    if candidate.is_absolute() or candidate == Path(".") or any(part == ".." for part in candidate.parts):
+        raise LibrarianError("--category must stay inside the canonical library")
+    ignored = ignored_directory_names()
+    for part in candidate.parts:
+        if part.startswith("."):
+            raise LibrarianError("--category cannot use hidden directories")
+        if part in ignored:
+            raise LibrarianError(f"--category cannot use ignored directory '{part}'")
+    return candidate
+
+
+def ensure_inside_root(path, root, label):
+    root = Path(root).resolve(strict=False)
+    resolved = Path(path).resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise LibrarianError(f"{label} escapes canonical library {short(root)}: {short(resolved)}") from exc
+    return resolved
+
+
+def paths_overlap(a, b):
+    a = Path(a).resolve(strict=False)
+    b = Path(b).resolve(strict=False)
+    try:
+        a.relative_to(b)
+        return True
+    except ValueError:
+        pass
+    try:
+        b.relative_to(a)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_adopt_category_ancestry(library_root, category_path):
+    """Ensure the category is a discoverable grouping path, not inside a skill boundary/link."""
+    current = Path(library_root).resolve(strict=False)
+    for part in category_path.parts:
+        current = current / part
+        if not os.path.lexists(current):
+            continue
+        if current.is_symlink() or link_target(current) is not None:
+            raise LibrarianError(
+                f"Adopt category cannot traverse a symlink/junction: {short(current)}"
+            )
+        if not current.is_dir():
+            raise LibrarianError(f"Adopt category component is not a directory: {short(current)}")
+        if (current / "SKILL.md").is_file():
+            raise LibrarianError(
+                f"Adopt category is inside existing skill boundary: {short(current)}"
+            )
+
+
+def validate_adopt_skill_tree(source, skill):
+    source = Path(source)
+    if not source.is_dir():
+        raise LibrarianError(f"Adopt source is not a directory: {short(source)}")
+    manifest = source / "SKILL.md"
+    if not manifest.is_file():
+        raise LibrarianError(f"Adopt source has no SKILL.md: {short(source)}")
+    fm_name = parse_frontmatter_name(manifest)
+    if fm_name is None:
+        raise LibrarianError(f"{short(manifest)} has no readable 'name' frontmatter")
+    if fm_name != skill:
+        raise LibrarianError(
+            f"Cannot adopt '{skill}': SKILL.md frontmatter name is '{fm_name}'"
+        )
+
+    source_root = source.resolve()
+    for current, dirnames, filenames in os.walk(source, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            child = Path(current) / name
+            linked_target = link_target(child)
+            if child.is_symlink():
+                try:
+                    raw_target = os.readlink(child)
+                except OSError as exc:
+                    raise LibrarianError(f"Cannot inspect internal link {short(child)}: {exc}") from exc
+                if Path(raw_target).is_absolute():
+                    raise LibrarianError(
+                        f"Cannot adopt absolute internal link: {short(child)} -> {raw_target}"
+                    )
+            elif linked_target is not None:
+                # Junctions/reparse points preserve machine-local absolute targets when copied.
+                raise LibrarianError(
+                    f"Cannot adopt non-portable junction/reparse point inside skill tree: {short(child)}"
+                )
+            else:
+                continue
+
+            if not child.exists():
+                raise LibrarianError(f"Cannot adopt broken internal link: {short(child)}")
+            target = child.resolve(strict=False)
+            try:
+                target.relative_to(source_root)
+            except ValueError as exc:
+                raise LibrarianError(
+                    f"Cannot adopt non-portable link outside the skill tree: {short(child)} -> {short(target)}"
+                ) from exc
+    return manifest
+
+
+def adopt(
+    skill,
+    user=False,
+    project=None,
+    agents=None,
+    library=None,
+    category=DEFAULT_ADOPT_CATEGORY,
+    dry_run=False,
+):
+    """Take ownership of one UNMANAGED runtime skill and replace it with a managed link."""
+    validate_adopt_skill_name(skill)
+    adapters = runtime_adapters(agents)
+    if len(adapters) != 1:
+        names = ", ".join(adapter.name for adapter in adapters)
+        raise LibrarianError(
+            f"adopt requires exactly one runtime; selected: {names or '(none)'}"
+        )
+    adapter = adapters[0]
+    scope, target_dir = resolve_scope(adapter, user=user, project=project, default_project=True)
+    runtime_entry = target_dir / skill
+
+    skills, _ = discover_skills()
+    if not os.path.lexists(runtime_entry):
+        raise LibrarianError(
+            f"No runtime entry named '{skill}' at {short(runtime_entry)}"
+        )
+
+    status, resolved = describe_entry(runtime_entry, skills)
+    if status != STATUS_UNMANAGED:
+        raise LibrarianError(
+            f"adopt only accepts UNMANAGED entries; {short(runtime_entry)} is {status}"
+        )
+    if skill in skills:
+        raise LibrarianError(
+            f"Canonical skill '{skill}' already exists at {short(skills[skill])}; refusing to create a duplicate"
+        )
+
+    external_link = link_target(runtime_entry)
+    source = external_link if external_link is not None else runtime_entry.resolve()
+    validate_adopt_skill_tree(source, skill)
+
+    library_root = resolve_adopt_library(library)
+    category_path = adopt_category_path(category)
+    validate_adopt_category_ancestry(library_root, category_path)
+    destination = library_root / category_path / skill
+    ensure_inside_root(destination, library_root, "Adopt destination")
+
+    if os.path.lexists(destination):
+        raise LibrarianError(f"Adopt destination already exists: {short(destination)}")
+    if paths_overlap(library_root, target_dir):
+        raise LibrarianError(
+            f"Canonical library and runtime target must not overlap: {short(library_root)} vs {short(target_dir)}"
+        )
+
+    label = f"{adapter.name}:{scope}"
+    if dry_run:
+        source_kind = "external link target" if external_link is not None else "runtime directory"
+        print(f"ADOPT    {skill} [{label}]")
+        print(f"  source ({source_kind}): {short(source)}")
+        print(f"  canonical:              {short(destination)}")
+        print(f"  runtime after adopt:    {short(runtime_entry)} -> {short(destination)}")
+        return 0
+
+    stage_root = Path(
+        tempfile.mkdtemp(prefix=f".skill-librarian-adopt-{skill}-", dir=str(library_root))
+    )
+    staged_skill = stage_root / skill
+    backup = target_dir / f".skill-librarian-adopt-backup-{skill}-{uuid.uuid4().hex}"
+    destination_created = False
+    runtime_moved = False
+
+    try:
+        shutil.copytree(source, staged_skill, symlinks=True)
+        validate_adopt_skill_tree(staged_skill, skill)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        ensure_inside_root(destination, library_root, "Adopt destination")
+        if os.path.lexists(destination):
+            raise LibrarianError(f"Adopt destination appeared during staging: {short(destination)}")
+
+        os.replace(staged_skill, destination)
+        destination_created = True
+
+        discovered_after_copy, _ = discover_skills()
+        if discovered_after_copy.get(skill) != destination.resolve():
+            raise LibrarianError(
+                f"Adopt destination is not discoverable as canonical skill '{skill}': {short(destination)}"
+            )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(backup):
+            raise LibrarianError(f"Unexpected adopt backup collision: {short(backup)}")
+        os.replace(runtime_entry, backup)
+        runtime_moved = True
+
+        make_link(destination, runtime_entry)
+
+        adopted_skills, _ = discover_skills()
+        final_status, final_target = describe_entry(runtime_entry, adopted_skills)
+        if final_status != STATUS_MANAGED or final_target != destination.resolve():
+            raise LibrarianError(
+                f"Adopt final verification failed: {short(runtime_entry)} is {final_status}"
+            )
+    except Exception as exc:
+        rollback_errors = []
+        try:
+            if os.path.lexists(runtime_entry):
+                remove_any_path(runtime_entry)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"remove replacement: {rollback_exc}")
+        try:
+            if runtime_moved and os.path.lexists(backup):
+                os.replace(backup, runtime_entry)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"restore runtime entry: {rollback_exc}")
+        try:
+            if destination_created and os.path.lexists(destination):
+                remove_any_path(destination)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"remove canonical copy: {rollback_exc}")
+
+        detail = f"Adopt failed for '{skill}': {exc}"
+        if rollback_errors:
+            detail += "; rollback problems: " + "; ".join(rollback_errors)
+        raise LibrarianError(detail) from exc
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+    try:
+        remove_any_path(backup)
+    except Exception as cleanup_exc:
+        print(
+            f"WARNING: adopted '{skill}' but could not remove backup {short(backup)}: {cleanup_exc}",
+            file=sys.stderr,
+        )
+
+    print(f"ADOPTED  {skill} [{label}] {short(runtime_entry)} -> {short(destination)}")
+    if external_link is not None:
+        print(f"PRESERVED external source: {short(source)}")
+    return 0
+
+
+def git_tracked(project_root, path):
+    try:
+        lexical = Path(os.path.abspath(path))
+        rel = lexical.relative_to(project_root)
+    except ValueError:
+        return False
+    proc = subprocess.run(
+        ["git", "-C", str(project_root), "ls-files", "--error-unmatch", "--", str(rel)],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def doctor(user=False, project=None, agents=None):
+    issues = []
+    notes = []
+
+    cfg = config()
+    raw_libraries = cfg.get("libraries", [])
+    if not isinstance(raw_libraries, list):
+        issues.append("libraries must be a JSON list of absolute path strings")
+        raw_libraries = []
+    for raw in raw_libraries:
+        try:
+            root = absolute_config_path(raw, "libraries[]")
+        except LibrarianError as exc:
+            issues.append(str(exc))
+            continue
+        if not root.is_dir():
+            issues.append(f"configured library is missing: {short(root)}")
+
+    # Force strict runtime configuration validation even when a selected target
+    # directory does not yet exist.
+    try:
+        runtime_config_root()
+        for adapter in RUNTIME_ADAPTERS.values():
+            adapter.runtime_config()
+    except LibrarianError as exc:
+        issues.append(str(exc))
+
+    skills, clashes = discover_skills()
+    for name, source in skills.items():
+        manifest = source / "SKILL.md"
+        fm_name = parse_frontmatter_name(manifest)
+        if fm_name is None:
+            issues.append(f"{name}: SKILL.md has no readable 'name' frontmatter")
+        elif fm_name != name:
+            issues.append(f"{name}: frontmatter name is '{fm_name}'")
+
+    for name, kept, ignored in clashes:
+        issues.append(
+            f"duplicate source name '{name}': using {short(kept)}, ignoring {short(ignored)}"
+        )
+
+    try:
+        targets = selected_targets(
+            user=user,
+            project=project,
+            include_default_both=True,
+            agents=agents,
+        )
+    except LibrarianError as exc:
+        issues.append(str(exc))
+        targets = []
+
+    mounted_by_runtime_scope = {}
+    project_roots = {}
+
+    for runtime, scope, target in targets:
+        key = (runtime, scope)
+        mounted_by_runtime_scope[key] = set()
+        if scope == "project":
+            project_roots[runtime] = git_root(project if project is not None else ".", required=False)
+
+        if not target.exists():
+            notes.append(f"{runtime}:{scope} target does not exist yet: {short(target)}")
+            continue
+        if not target.is_dir():
+            issues.append(f"{runtime}:{scope} target is not a directory: {short(target)}")
+            continue
+
+        try:
+            entries = sorted(target.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            issues.append(f"cannot inspect {runtime}:{scope} target {short(target)}: {exc}")
+            continue
+
+        for entry in entries:
+            mounted_by_runtime_scope[key].add(entry.name)
+            status, resolved = describe_entry(entry, skills)
+            label = f"{runtime}:{scope}"
+            if status == STATUS_MANAGED:
+                project_root = project_roots.get(runtime)
+                if scope == "project" and project_root and git_tracked(project_root, entry):
+                    issues.append(
+                        f"{label} mount '{entry.name}' is tracked by Git; local absolute links are machine-specific"
+                    )
+                continue
+            if status == STATUS_UNMANAGED:
+                issues.append(f"{label} unmanaged runtime entry: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_BROKEN_LINK:
+                issues.append(f"{label} broken link: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_MISSING_SOURCE:
+                issues.append(f"{label} managed source is missing: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_WRONG_LINK:
+                issues.append(f"{label} wrong link: {short(entry)} -> {short(resolved)}")
+            elif status == STATUS_RETIRED:
+                issues.append(f"{label} retired skill is still mounted: {short(entry)} -> {short(resolved)}")
+            else:
+                issues.append(f"{label} unknown status {status}: {short(entry)}")
+
+    # Duplicate user/project mounts are only conflicts inside the same runtime.
+    for runtime in {runtime for runtime, _scope, _target in targets}:
+        duplicate_mounts = mounted_by_runtime_scope.get((runtime, "user"), set()) & mounted_by_runtime_scope.get(
+            (runtime, "project"), set()
+        )
+        for name in sorted(duplicate_mounts):
+            issues.append(f"{runtime}: '{name}' is mounted in both user and project scope")
+
+    if notes:
+        print("Notes:")
+        for note in notes:
+            print(f"  NOTE  {note}")
+    if issues:
+        print("Issues:")
+        for issue in issues:
+            print(f"  FAIL  {issue}")
+        print(f"\nDoctor found {len(issues)} issue(s).")
+        return 1
+
+    print("Doctor: healthy. No skill-library or runtime mount problems found.")
+    return 0
+
+
+def legacy_targets():
+    seen = set()
+    result = []
+    raw_targets = config().get("targets", DEFAULT_TARGETS)
+    if not isinstance(raw_targets, list):
+        raise LibrarianError("targets must be a JSON list of absolute path strings")
+    for raw in raw_targets:
+        target = absolute_config_path(raw, "targets[]")
+        if target in seen:
+            continue
+        seen.add(target)
+        if target.is_dir():
+            result.append(target)
+        else:
+            print(f"  (configured target doesn't exist, skipping: {short(target)})")
+    return result
+
+
+def deploy_all(dry_run=False, only=None):
+    skills, clashes = discover_skills()
+    for name, kept, ignored in clashes:
+        print(f"  (name clash: '{name}'; keeping {short(kept)}, ignoring {short(ignored)})")
+    if only:
+        if only not in skills:
+            raise LibrarianError(f"No skill named '{only}' in any configured library.")
+        skills = {only: skills[only]}
+
+    targets = legacy_targets()
+    if not targets:
+        raise LibrarianError("No existing target dirs - nothing to deploy into.")
+
+    print(f"Skills:    {', '.join(sorted(skills))}")
+    print(f"Targets:   {', '.join(short(t) for t in targets)}")
+    print(
+        f"Link type: {'junction (Windows)' if os.name == 'nt' else 'symlink'}"
+        + ("   [DRY RUN - no changes]" if dry_run else "")
+    )
+    print()
+
+    counts = {"linked": 0, "ok": 0, "repaired": 0, "replaced": 0, "skipped": 0}
+    for skill, src in sorted(skills.items()):
+        for target in targets:
+            link = target / skill
+            current = link_target(link)
+            if current == src:
+                counts["ok"] += 1
+                continue
+            if current is not None:
+                if dry_run:
+                    print(f"  REPAIR    {short(link)}  (relink -> {short(src)})")
+                else:
+                    remove_link(link)
+                    make_link(src, link)
+                    print(f"  repaired  {short(link)}")
+                counts["repaired"] += 1
+                continue
+            if os.path.lexists(link):
+                if dry_run:
+                    print(f"  REAL DIR  {short(link)}  (would prompt to replace)")
+                    counts["skipped"] += 1
+                    continue
+                ans = input(
+                    f"  {short(link)} is a real directory (a drifted copy). "
+                    f"Replace it with a link to {short(src)}? [y/N] "
+                )
+                if ans.strip().lower() == "y":
+                    if link.is_dir() and not link.is_symlink():
+                        shutil.rmtree(link)
+                    else:
+                        link.unlink()
+                    make_link(src, link)
+                    print(f"  replaced  {short(link)}")
+                    counts["replaced"] += 1
+                else:
+                    print(f"  skipped   {short(link)}")
+                    counts["skipped"] += 1
+                continue
+            if dry_run:
+                print(f"  LINK      {short(link)}")
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                make_link(src, link)
+                print(f"  linked    {short(link)}")
+            counts["linked"] += 1
+
+    print()
+    print("Summary: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return 0
+
+
+def add_scope_args(parser, allow_force=False, allow_agent=True):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--user", action="store_true", help="use runtime user scope")
+    group.add_argument("--project", metavar="REPO", help="use runtime project scope under REPO")
+    if allow_agent:
+        parser.add_argument(
+            "-a",
+            "--agent",
+            dest="agents",
+            action="append",
+            metavar="RUNTIME",
+            help="runtime to manage: codex, claude-code, or all; repeatable",
+        )
+    if allow_force:
+        parser.add_argument("--force", action="store_true", help="repair an existing wrong link")
+
+
+def scoped_main(argv):
+    parser = argparse.ArgumentParser(description="Manage source-of-truth skills and runtime mounts.")
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    p_available = subs.add_parser("available", help="list skills in configured source libraries")
+    p_available.set_defaults(handler=lambda a: available())
+
+    p_mount = subs.add_parser("mount", help="mount a skill by symlink/junction")
+    p_mount.add_argument("skill")
+    add_scope_args(p_mount, allow_force=True)
+    p_mount.add_argument("--dry-run", action="store_true")
+    p_mount.set_defaults(
+        handler=lambda a: mount(
+            a.skill,
+            user=a.user,
+            project=a.project,
+            dry_run=a.dry_run,
+            force=a.force,
+            agents=a.agents,
+        )
+    )
+
+    p_unmount = subs.add_parser("unmount", help="remove a mounted link without touching its source")
+    p_unmount.add_argument("skill")
+    add_scope_args(p_unmount)
+    p_unmount.add_argument("--dry-run", action="store_true")
+    p_unmount.set_defaults(
+        handler=lambda a: unmount(
+            a.skill,
+            user=a.user,
+            project=a.project,
+            dry_run=a.dry_run,
+            agents=a.agents,
+        )
+    )
+
+    p_adopt = subs.add_parser("adopt", help="adopt one unmanaged runtime skill into a canonical library")
+    p_adopt.add_argument("skill")
+    add_scope_args(p_adopt)
+    p_adopt.add_argument(
+        "--library",
+        metavar="PATH",
+        help="configured canonical library root; required when more than one external library exists",
+    )
+    p_adopt.add_argument(
+        "--category",
+        default=DEFAULT_ADOPT_CATEGORY,
+        help=f"relative category inside the canonical library (default: {DEFAULT_ADOPT_CATEGORY})",
+    )
+    p_adopt.add_argument("--dry-run", action="store_true")
+    p_adopt.set_defaults(
+        handler=lambda a: adopt(
+            a.skill,
+            user=a.user,
+            project=a.project,
+            agents=a.agents,
+            library=a.library,
+            category=a.category,
+            dry_run=a.dry_run,
+        )
+    )
+
+    p_list = subs.add_parser("list", help="list runtime skills and management status")
+    add_scope_args(p_list)
+    p_list.add_argument("--json", action="store_true", dest="json_output", help="emit machine-readable JSON")
+    p_list.set_defaults(
+        handler=lambda a: list_mounts(
+            user=a.user,
+            project=a.project,
+            agents=a.agents,
+            json_output=a.json_output,
+        )
+    )
+
+    p_doctor = subs.add_parser("doctor", help="diagnose libraries, mounts, duplicates, and unmanaged skills")
+    add_scope_args(p_doctor)
+    p_doctor.set_defaults(
+        handler=lambda a: doctor(user=a.user, project=a.project, agents=a.agents)
+    )
+
+    args = parser.parse_args(argv)
+    return args.handler(args)
+
+
+def import_main(argv):
+    """Load the acquisition workflow lazily so normal runtime commands stay lightweight."""
+    module_path = SCRIPT_PATH.with_name("skill_import.py")
+    spec = importlib.util.spec_from_file_location("skill_librarian_import", module_path)
+    if spec is None or spec.loader is None:
+        raise LibrarianError(f"Cannot load import workflow from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main(argv, control=sys.modules[__name__])
+
+
+def legacy_main(argv):
+    parser = argparse.ArgumentParser(
+        description="Link skills from this repo + configured libraries into runtime skill dirs."
+    )
+    parser.add_argument("--dry-run", action="store_true", help="show actions, change nothing")
+    parser.add_argument("--skill", metavar="NAME", help="deploy just one skill")
+    args = parser.parse_args(argv)
+    return deploy_all(dry_run=args.dry_run, only=args.skill)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if argv and argv[0] == "import":
+            return import_main(argv[1:])
+        if argv and argv[0] in SCOPED_COMMANDS:
+            return scoped_main(argv)
+        return legacy_main(argv)
+    except LibrarianError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

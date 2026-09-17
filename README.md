@@ -151,6 +151,8 @@ python3 skill-librarian/scripts/skill_librarian.py \
 
 The category path in the source library does not appear in the runtime mount. A source at `3d_reconstruction_skills/reconstruction-geometry` mounts using only the skill basename.
 
+Successful project-scoped `mount` and `adopt` operations automatically register the Git root for global inventory. Existing project mounts created before this feature need a one-time `project add` migration; the mount itself does not need to be recreated.
+
 ### Mount as a user skill
 
 Codex user scope:
@@ -332,6 +334,46 @@ Current status values are:
 
 This is intentionally strict: a skill installed directly by Codex, Claude Code, `npx skills`, or another tool remains **unmanaged** until you explicitly run `adopt` or remove it.
 
+## Global runtime inventory
+
+`--global` is an aggregate inventory view, not a third scope. It combines runtime user scope with every explicitly registered project scope.
+
+The Python script and executable launcher expose the same commands:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py list --global
+./bin/skill-librarian list --global
+```
+
+Register project roots explicitly:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py project add /path/to/repo
+python3 skill-librarian/scripts/skill_librarian.py projects
+python3 skill-librarian/scripts/skill_librarian.py project remove /path/to/repo
+```
+
+For a project that already had a project-scope mount before the registry feature, register it once from that Git repository:
+
+```bash
+cd /path/to/existing/project
+python3 /path/to/skill_manager/skill-librarian/scripts/skill_librarian.py project add .
+```
+
+For example, if `reconstruction-geometry` is already mounted in that project's `.agents/skills/`, registering the project is enough; do not remount the skill.
+
+Then the global view can show both scopes together:
+
+```text
+RUNTIME       SCOPE    PROJECT                     SKILL                    STATUS
+codex         user     -                           using-agent-skills       MANAGED
+codex         project  ~/path/to/project           reconstruction-geometry MANAGED
+```
+
+The registry is machine-local at `~/.config/skill-librarian/projects.json` on macOS/Linux by default (or under `$XDG_CONFIG_HOME` when configured). It stores explicit Git roots and never recursively scans the whole home directory. Use `--agent all` to inspect all enabled runtimes and `--json` for machine-readable output.
+
+See `docs/global-runtime-inventory.md` for details.
+
 ## Doctor
 
 ```bash
@@ -407,4 +449,5 @@ v0.3  runtime adapters + unmanaged detection
 v0.4  adopt unmanaged runtime skills into the canonical library
 v0.5  import external skills + provenance metadata
 v0.6  upstream diff / update using provenance
+v0.7  registered-project global runtime inventory
 ```
