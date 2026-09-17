@@ -35,7 +35,8 @@ class UnifiedCliTests(unittest.TestCase):
         vendor.main.assert_called_once()
         args, kwargs = vendor.main.call_args
         self.assertEqual(args[0], ["demo-skill", "--project", "/tmp/repo"])
-        self.assertIs(kwargs["control"], cli)
+        self.assertIs(kwargs["control"], cli._CONTROL_API)
+        self.assertIs(kwargs["control"].discover_skills, cli.discover_skills)
         self.assertIs(kwargs["register_project"], cli._register_project)
 
     def test_normal_commands_keep_core_behavior(self):
