@@ -24,6 +24,21 @@ class UnifiedCliTests(unittest.TestCase):
             self.assertEqual(cli.main(["projects"]), 18)
         inventory.main.assert_called_once_with(["projects"])
 
+    def test_vendor_routes_to_vendor_workflow(self):
+        vendor = mock.Mock()
+        vendor.main.return_value = 19
+        with mock.patch.object(cli, "_load_vendor_module", return_value=vendor):
+            self.assertEqual(
+                cli.main(["vendor", "demo-skill", "--project", "/tmp/repo"]),
+                19,
+            )
+        vendor.main.assert_called_once()
+        args, kwargs = vendor.main.call_args
+        self.assertEqual(args[0], ["demo-skill", "--project", "/tmp/repo"])
+        self.assertIs(kwargs["control"], cli._CONTROL_API)
+        self.assertIs(kwargs["control"].discover_skills, cli.discover_skills)
+        self.assertIs(kwargs["register_project"], cli._register_project)
+
     def test_normal_commands_keep_core_behavior(self):
         with mock.patch.object(cli, "_CORE_MAIN", return_value=0) as core_main:
             self.assertEqual(cli.main(["list", "--user"]), 0)

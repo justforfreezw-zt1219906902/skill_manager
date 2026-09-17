@@ -3,9 +3,8 @@
 
 The historical implementation is kept in skill_librarian_core.py and executed
 inside this module namespace so existing imports, tests, monkey-patching, and
-function globals keep behaving as before. This wrapper only adds command routing
-for the registered-project inventory and automatic registration after successful
-project-scoped mount/adopt operations.
+function globals keep behaving as before. This wrapper adds registered-project
+inventory, vendored project skills, and automatic project registration.
 """
 
 import importlib.util
@@ -29,6 +28,29 @@ FRAMEWORK_ROOT = SKILL_DIR.parent
 _CORE_MAIN = main
 
 
+class _ControlFacade:
+    """Expose this module's live globals without depending on sys.modules registration."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+_CONTROL_API = _ControlFacade()
+
+
+def _load_vendor_module():
+    module_path = SCRIPT_PATH.with_name("skill_vendor.py")
+    spec = importlib.util.spec_from_file_location("skill_librarian_vendor", module_path)
+    if spec is None or spec.loader is None:
+        raise LibrarianError(f"Cannot load skill vendor workflow from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_inventory_module():
     module_path = SCRIPT_PATH.with_name("project_inventory.py")
     spec = importlib.util.spec_from_file_location("skill_librarian_inventory", module_path)
@@ -36,6 +58,20 @@ def _load_inventory_module():
         raise LibrarianError(f"Cannot load project inventory from {module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+
+    # project_inventory intentionally re-loads the control module. Decorate its
+    # runtime rows here so a valid physical project snapshot is globally visible
+    # as VENDORED rather than looking like an arbitrary UNMANAGED directory.
+    vendor = _load_vendor_module()
+    original_list_target = module.core.list_target
+
+    def vendor_aware_list_target(runtime, scope, target_dir, skills):
+        rows = original_list_target(runtime, scope, target_dir, skills)
+        if scope == "project":
+            return vendor.annotate_runtime_rows(rows)
+        return rows
+
+    module.core.list_target = vendor_aware_list_target
     return module
 
 
@@ -60,8 +96,19 @@ def _project_scope_path(argv):
     return "."
 
 
+def _register_project(path):
+    return _load_inventory_module().add_project(path)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    if argv and argv[0] == "vendor":
+        return _load_vendor_module().main(
+            argv[1:],
+            control=_CONTROL_API,
+            register_project=_register_project,
+        )
 
     if _is_inventory_command(argv):
         return _load_inventory_module().main(argv)
@@ -73,7 +120,7 @@ def main(argv=None):
     # versions still need a one-time `project add <repo>` migration.
     project_path = _project_scope_path(argv)
     if rc == 0 and project_path is not None:
-        _load_inventory_module().add_project(project_path)
+        _register_project(project_path)
 
     return rc
 
