@@ -298,6 +298,50 @@ Safety checks happen before canonical ownership changes. Import rejects duplicat
 
 This acquisition layer is intentionally independent of `npx skills add`: external tools may still be used for discovery, but `skill_manager import` avoids installing into runtime directories while establishing canonical ownership.
 
+## Upstream status, provenance migration and safe update
+
+Runtime ownership is not update status: a `MANAGED` skill may still be outdated upstream. Inspect every active canonical skill, whether mounted or not:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py upstream status --all
+python3 skill-librarian/scripts/skill_librarian.py upstream status --all --json
+```
+
+Results are `SAME`, `OUTDATED`, `LOCAL_MODIFIED`, `DIVERGED`, `UNTRACKABLE`, or per-skill `ERROR`. The comparison includes the full skill payload, not just `SKILL.md`. Shared source/ref checkouts and failures are cached for the duration of the command; one failing source does not hide the rest of a batch.
+
+For old copies/adoptions without `.skill-source.json`, explicitly identify the source and preview migration:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py provenance migrate shipping-and-launch \
+  --source addyosmani/agent-skills --ref main --history-limit 100 --dry-run
+```
+
+Migration writes metadata only after a full-tree match with an upstream revision. `NO_MATCH` leaves the skill unchanged and untrackable; it never invents a clean baseline. Remove `--dry-run` to record a verified match. A known historical commit can be supplied with `--baseline-ref`. Existing metadata is not overwritten.
+
+For a batch, copy and edit `examples/provenance-migration.example.json`:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py provenance migrate \
+  --manifest migration.json --dry-run --json
+python3 skill-librarian/scripts/skill_librarian.py provenance migrate \
+  --manifest migration.json --json
+```
+
+Preview then apply safe updates:
+
+```bash
+python3 skill-librarian/scripts/skill_librarian.py upstream update --all --dry-run --json
+python3 skill-librarian/scripts/skill_librarian.py upstream update shipping-and-launch
+# Optional: update all eligible skills, reporting blocked items without overwriting them.
+python3 skill-librarian/scripts/skill_librarian.py upstream update --all --json
+```
+
+Upstream updates preserve local modifications, refuse unknown baselines and missing upstream paths, validate staged content, retain a backup and roll back caught publication failures. There is no destructive `--force`. Use `--expected-revision <sha>` to bind a single update to a reviewed upstream commit. Pinned tags/commits remain pinned; use an explicit single-skill `--ref` to change the tracking target.
+
+Both invocation styles are supported: `./bin/skill-librarian upstream ...` and the Python script. Canonical paths and runtime links are preserved; project vendor copies are **not** automatically updated. No operation commits or pushes your library. Add `.skill-librarian-*` to the canonical library's `.gitignore` to exclude retained backups/temporary state, but keep `.skill-source.json` tracked.
+
+See [docs/upstream-lifecycle.md](docs/upstream-lifecycle.md) for safety boundaries, historical matching, recovery, JSON and exit codes. The original read-only `skill_upstream.py status` entrypoint remains compatible.
+
 ## Runtime inspection and unmanaged detection
 
 `list` reports the runtime, scope, skill name, status, and resolved target:
@@ -493,4 +537,5 @@ v0.5  import external skills + provenance metadata
 v0.6  upstream diff / update using provenance
 v0.7  registered-project global runtime inventory
 v0.8  vendored project skill lifecycle
+v0.9  upstream batch status + verified provenance migration + safe update
 ```

@@ -4,7 +4,7 @@
 The historical implementation is kept in skill_librarian_core.py and executed
 inside this module namespace so existing imports, tests, monkey-patching, and
 function globals keep behaving as before. This wrapper adds registered-project
-inventory, vendored project skills, and automatic project registration.
+inventory, vendored project skills, upstream lifecycle, and project registration.
 """
 
 import importlib.util
@@ -39,6 +39,16 @@ class _ControlFacade:
 
 
 _CONTROL_API = _ControlFacade()
+
+
+def _load_lifecycle_module():
+    module_path = SCRIPT_PATH.with_name("skill_lifecycle.py")
+    spec = importlib.util.spec_from_file_location("skill_librarian_lifecycle", module_path)
+    if spec is None or spec.loader is None:
+        raise LibrarianError(f"Cannot load upstream lifecycle from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_vendor_module():
@@ -102,6 +112,24 @@ def _register_project(path):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    if argv and argv[0] in {"upstream", "provenance"}:
+        return _load_lifecycle_module().main(argv, control=_CONTROL_API)
+
+    if argv in (["--help"], ["-h"]):
+        try:
+            _CORE_MAIN(argv)
+        except SystemExit as exc:
+            if exc.code:
+                raise
+        print("\nAdditional commands (same Python and bin entrypoints):")
+        print("  upstream status [SKILL | --all] [--json]")
+        print("  upstream update [SKILL | --all] [--dry-run] [--json]")
+        print("  provenance migrate SKILL --source OWNER/REPO [--dry-run]")
+        print("  provenance migrate --manifest FILE [--dry-run]")
+        print("  list --global [--agent all]; projects; project add/remove PATH")
+        print("  vendor [status|update|remove] SKILL --project REPO")
+        return 0
 
     if argv and argv[0] == "vendor":
         return _load_vendor_module().main(

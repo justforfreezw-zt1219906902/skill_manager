@@ -81,9 +81,15 @@ def _run_git(args, cwd=None, check=True, sensitive_values=()):
             cwd=str(cwd) if cwd is not None else None,
             capture_output=True,
             text=True,
+            timeout=120,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
     except FileNotFoundError as exc:
         raise SourceError("git is required for Git-backed skill imports") from exc
+    except subprocess.TimeoutExpired as exc:
+        # Do not echo the command: it may contain a credential-bearing URL.
+        operation = args[0] if args else "command"
+        raise SourceError(f"git {operation} timed out after 120 seconds") from exc
 
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "git command failed").strip()
