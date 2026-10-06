@@ -86,7 +86,7 @@ class LifecycleTests(unittest.TestCase):
     def commit(self, message):
         self.git("add", ".")
         self.git("commit", "-m", message)
-        return self.git("rev-parse", "HEAD").stdout.strip() if False else self.git("rev-parse", "HEAD")
+        return self.git("rev-parse", "HEAD")
 
     def metadata(self, name="foo", **extra):
         value = {
@@ -301,6 +301,22 @@ class LifecycleTests(unittest.TestCase):
                 self.update()
         self.assertEqual((self.canonical / "references" / "rules.md").read_text(), "late user edit\n")
 
+    def test_metadata_edit_after_inspection_is_not_overwritten(self):
+        self.change_upstream()
+        original_inspect = life.inspect
+
+        def inspect_then_edit(*args, **kwargs):
+            result = original_inspect(*args, **kwargs)
+            self.metadata(imported_at="concurrent external edit")
+            return result
+
+        with mock.patch.object(life, "inspect", side_effect=inspect_then_edit):
+            with self.assertRaisesRegex(life.LifecycleError, "Provenance changed"):
+                self.update()
+        metadata = json.loads((self.canonical / ".skill-source.json").read_text())
+        self.assertEqual(metadata["imported_at"], "concurrent external edit")
+        self.assertEqual((self.canonical / "references" / "rules.md").read_text(), "baseline\n")
+
     def test_existing_lock_prevents_update(self):
         lock = self.canonical.parent / ".skill-librarian-upstream-foo.lock"
         lock.mkdir()
@@ -340,6 +356,14 @@ class LifecycleTests(unittest.TestCase):
         rc, data = self.cli(["upstream", "status", "foo"])
         self.assertEqual(rc, 2)
         self.assertNotIn("TOP_SECRET", json.dumps(data))
+
+    def test_github_credentials_are_rejected_before_url_normalization(self):
+        for remote in ("https://user:TOP_SECRET@github.com/acme/skills", "https://github.com/acme/skills?token=TOP_SECRET"):
+            with self.subTest(remote_kind="credential-bearing GitHub URL"):
+                with self.assertRaises(life.LifecycleError) as caught:
+                    life._remote(remote)
+                self.assertNotIn("TOP_SECRET", str(caught.exception))
+        self.assertEqual(self.acquire.call_count, 0)
 
     def test_git_timeout_does_not_echo_credential_bearing_command(self):
         secret_url = "https://user:TOP_SECRET@example.com/skills.git"
