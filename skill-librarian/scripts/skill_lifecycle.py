@@ -60,14 +60,15 @@ def _remote(value):
         raise LifecycleError("Source must be a portable Git URL or owner/repo")
     if any(ord(c) < 32 for c in value) or value.startswith("-"):
         raise LifecycleError("Invalid Git source")
+    raw = urlsplit(value)
+    if raw.password or (raw.username and raw.scheme != "ssh") or raw.query or raw.fragment:
+        raise LifecycleError("Do not embed credentials, query strings, or fragments in a Git source")
     url, inferred, hint = source._parse_remote_source(value)
     if inferred is not None or hint is not None:
         raise LifecycleError("Use a repository-root source plus --ref / --source-path")
     parsed = urlsplit(url)
     if parsed.scheme not in {"https", "http", "ssh", "git"} and not re.fullmatch(r"git@[^:]+:.+", url):
         raise LifecycleError("Lifecycle tracking requires a portable remote Git source, not a local path")
-    if parsed.password or (parsed.username and parsed.scheme != "ssh") or parsed.query or parsed.fragment:
-        raise LifecycleError("Do not embed credentials, query strings, or fragments in a Git source")
     return source.sanitize_recorded_source(url)
 
 
@@ -182,7 +183,10 @@ def _assert_unchanged(path, skill, fingerprint, raw_metadata, control):
 
 def inspect(skill, *, control, snapshots, ref=None):
     path = _canonical(skill, control)
+    raw = _metadata_bytes(path)
     metadata = _metadata(path, skill)
+    if _metadata_bytes(path) != raw:
+        raise LifecycleError("Provenance changed while inspecting")
     result = {
         "skill": skill, "canonical": str(path), "status": "UNTRACKABLE",
         "source": metadata.get("source") if metadata else None,
@@ -195,7 +199,6 @@ def inspect(skill, *, control, snapshots, ref=None):
     if not metadata or metadata.get("type") != "git" or not metadata.get("source") or not metadata.get("revision"):
         result["reason"] = "Missing verified Git provenance; run provenance migrate with an explicit source"
         return result
-    raw = _metadata_bytes(path)
     local_hash = _hash(path, skill, control)
     baseline = snapshots.get(metadata["source"], metadata["revision"])
     baseline_skill = _locate(baseline, metadata["source_path"], skill)
@@ -268,7 +271,10 @@ def _verify_published(path, skill, expected_hash, expected_metadata, control):
 def update(skill, *, control, snapshots, dry_run=False, ref=None, expected_revision=None):
     path = _canonical(skill, control)
     with nullcontext() if dry_run else _lock(path):
+        raw_metadata = _metadata_bytes(path)
         report = inspect(skill, control=control, snapshots=snapshots, ref=ref)
+        if _metadata_bytes(path) != raw_metadata:
+            raise LifecycleError("Provenance changed after inspection; retry after review")
         result = dict(report, action="BLOCKED", dry_run=dry_run)
         if report["status"] not in {"SAME", "OUTDATED"} or not report.get("upstream_present"):
             result["reason"] = report.get("reason") or "Local changes/unknown baseline cannot be overwritten"
@@ -280,7 +286,6 @@ def update(skill, *, control, snapshots, dry_run=False, ref=None, expected_revis
             return dict(result, action="UNCHANGED")
         _canonical(skill, control, writing=True)
         _guard_local_tree(path)
-        raw_metadata = _metadata_bytes(path)
         acquired = snapshots.get(old_metadata["source"], report["ref"])
         incoming = _locate(acquired, old_metadata["source_path"], skill)
         _validate_incoming(incoming, skill, control)
