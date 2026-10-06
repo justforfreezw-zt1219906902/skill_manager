@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "skills": [
+    {
+      "skill": "shipping-and-launch",
+      "source": "addyosmani/agent-skills",
+      "source_path": "skills/shipping-and-launch",
+      "ref": "main",
+      "history_limit": 100
+    },
+    {
+      "skill": "karpathy-guidelines",
+      "source": "multica-ai/andrej-karpathy-skills",
+      "source_path": "skills/karpathy-guidelines",
+      "ref": "main",
+      "history_limit": 100
+    }
+  ]
+}
