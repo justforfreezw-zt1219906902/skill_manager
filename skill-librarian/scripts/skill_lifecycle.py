@@ -80,6 +80,12 @@ def _relative(value):
     return path.as_posix()
 
 
+def _history_limit(value):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 500:
+        raise LifecycleError("history_limit must be an integer between 0 and 500")
+    return value
+
+
 class Snapshots:
     """Per-command cache: shared refs are fetched once, including failures."""
     def __init__(self):
@@ -225,10 +231,14 @@ def _lock(path):
     try:
         lock.mkdir(mode=0o700)
     except FileExistsError as exc:
-        raise LifecycleError(f"Skill is locked; inspect the owning process before removing {lock}") from exc
+        raise LifecycleError(f"Skill is locked; inspect {lock}/owner.json before removing a stale lock") from exc
+    owner = lock / "owner.json"
     try:
+        owner.write_text(json.dumps({"pid": os.getpid(), "created_at": _now()}) + "\n", encoding="utf-8")
         yield
     finally:
+        if owner.exists():
+            owner.unlink()
         lock.rmdir()
 
 
@@ -301,16 +311,18 @@ def update(skill, *, control, snapshots, dry_run=False, ref=None, expected_revis
             os.replace(staged, path)
             published = True
             _verify_published(path, skill, report["upstream_fingerprint"], metadata, control)
-        except Exception as exc:
+        except BaseException as exc:
             if moved:
                 try:
                     if published and os.path.lexists(path):
                         os.replace(path, stage_root / "failed-new-snapshot")
                     os.replace(backup, path)
-                except Exception as rollback_exc:
+                except BaseException as rollback_exc:
                     # Do not remove either snapshot if rollback cannot complete.
                     raise LifecycleError(f"Rollback needs manual recovery; backup={backup}, stage={stage_root}") from rollback_exc
             shutil.rmtree(stage_root, ignore_errors=True)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             raise LifecycleError(f"Update failed; original snapshot restored: {exc}") from exc
         shutil.rmtree(stage_root, ignore_errors=True)
         return dict(result, action="UPDATED" if report["status"] == "OUTDATED" else "REFRESHED", backup=str(backup))
@@ -318,7 +330,8 @@ def update(skill, *, control, snapshots, dry_run=False, ref=None, expected_revis
 
 def _git(args, cwd=None):
     try:
-        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LifecycleError("Local Git history inspection failed or timed out") from exc
     if proc.returncode:
@@ -348,14 +361,41 @@ def _historical_match(acquired, relative, skill, fingerprint, limit, control):
     return None
 
 
+def _publish_provenance(path, skill, fingerprint, metadata, control):
+    """Publish complete metadata atomically without replacing an existing path."""
+    expected = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd, filename = tempfile.mkstemp(prefix=".skill-librarian-provenance-", dir=path.parent)
+    temporary = Path(filename)
+    target = path / PROVENANCE
+    linked = False
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(expected)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _assert_unchanged(path, skill, fingerprint, None, control)
+        # Same-filesystem hard link: unlike replace(), this never clobbers a
+        # target which appeared concurrently, including a dangling symlink.
+        os.link(temporary, target)
+        linked = True
+        _assert_unchanged(path, skill, fingerprint, expected, control)
+    except BaseException:
+        # Remove only our unchanged metadata, never a concurrent writer's file.
+        if linked and not target.is_symlink() and target.is_file():
+            if os.path.samestat(temporary.stat(), target.stat()) and target.read_bytes() == expected:
+                target.unlink()
+        raise
+    finally:
+        temporary.unlink()
+
+
 def migrate(skill, *, remote, control, snapshots, ref=None, source_path=None,
             baseline_ref=None, history_limit=0, dry_run=False):
     path = _canonical(skill, control, writing=True)
     url = _remote(remote)
     _ref(ref)
     _ref(baseline_ref)
-    if not isinstance(history_limit, int) or isinstance(history_limit, bool) or not 0 <= history_limit <= 500:
-        raise LifecycleError("history_limit must be an integer between 0 and 500")
+    _history_limit(history_limit)
     with nullcontext() if dry_run else _lock(path):
         metadata = _metadata(path, skill)
         if metadata is not None:
@@ -378,30 +418,16 @@ def migrate(skill, *, remote, control, snapshots, ref=None, source_path=None,
         if revision is None:
             result["reason"] = "No full-tree match; origin/baseline remains unverified and no metadata was written"
             return result
+        timestamp = _now()
         metadata = {
             "schema_version": 1, "type": "git", "source": url, "source_path": relative,
             "ref": ref, "revision": revision, "dirty": False, "skill": skill,
-            "acquired_via": "migration", "imported_at": _now(), "migrated_at": _now(),
+            "acquired_via": "migration", "imported_at": timestamp, "migrated_at": timestamp,
             "baseline_fingerprint": fingerprint, "baseline_verified": True,
         }
         if dry_run:
             return dict(result, action="WOULD_MIGRATE")
-        _assert_unchanged(path, skill, fingerprint, None, control)
-        target = path / PROVENANCE
-        # Exclusive create also refuses a symlink or metadata appearing mid-flight.
-        try:
-            with target.open("x", encoding="utf-8") as handle:
-                json.dump(metadata, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _assert_unchanged(path, skill, fingerprint, target.read_bytes(), control)
-        except FileExistsError as exc:
-            raise LifecycleError("Provenance appeared during migration; refusing to replace it") from exc
-        except Exception:
-            if target.is_file() and not target.is_symlink():
-                target.unlink()
-            raise
+        _publish_provenance(path, skill, fingerprint, metadata, control)
         return dict(result, action="MIGRATED")
 
 
@@ -423,6 +449,7 @@ def read_manifest(filename):
         _remote(row["source"])
         _ref(row.get("ref"))
         _ref(row.get("baseline_ref"))
+        _history_limit(row.get("history_limit", 0))
         if row.get("source_path") is not None:
             _relative(row["source_path"])
     return data["skills"]
