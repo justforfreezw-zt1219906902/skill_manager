@@ -33,7 +33,9 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # macOS /var is a symlink to /private/var; injections must compare the
+        # same physical paths that canonical discovery returns in production.
+        self.root = Path(self.tmp.name).resolve()
         self.framework = self.root / "framework"
         self.skill_dir = self.framework / "skill-librarian"
         self.skill_dir.mkdir(parents=True)
@@ -84,7 +86,7 @@ class LifecycleTests(unittest.TestCase):
     def commit(self, message):
         self.git("add", ".")
         self.git("commit", "-m", message)
-        return self.git("rev-parse", "HEAD")
+        return self.git("rev-parse", "HEAD").stdout.strip() if False else self.git("rev-parse", "HEAD")
 
     def metadata(self, name="foo", **extra):
         value = {
@@ -258,7 +260,33 @@ class LifecycleTests(unittest.TestCase):
         with mock.patch.object(life.os, "replace", side_effect=fail_once):
             with self.assertRaises(life.LifecycleError):
                 self.update()
+        self.assertTrue(failed[0], "The publication failure must actually be injected")
         self.assertEqual((self.canonical / "references" / "rules.md").read_text(), "baseline\n")
+
+    def test_keyboard_interrupt_after_publication_restores_original(self):
+        self.change_upstream()
+        with mock.patch.object(life, "_verify_published", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.update()
+        self.assertEqual((self.canonical / "references" / "rules.md").read_text(), "baseline\n")
+        self.assertFalse((self.canonical.parent / ".skill-librarian-upstream-foo.lock").exists())
+
+    def test_failed_rollback_keeps_recovery_backup_and_stage(self):
+        self.change_upstream()
+        original_replace = os.replace
+
+        def refuse_restore(src, dst):
+            if Path(src).name.startswith(".skill-librarian-backup-"):
+                raise OSError("restore unavailable")
+            return original_replace(src, dst)
+
+        with mock.patch.object(life, "_verify_published", side_effect=RuntimeError("injected")), mock.patch.object(life.os, "replace", side_effect=refuse_restore):
+            with self.assertRaisesRegex(life.LifecycleError, "manual recovery"):
+                self.update()
+        backups = list(self.canonical.parent.glob(".skill-librarian-backup-foo-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "references" / "rules.md").read_text(), "baseline\n")
+        self.assertTrue(list(self.canonical.parent.glob(".skill-librarian-stage-*")))
 
     def test_late_user_edits_are_detected_before_swap(self):
         self.change_upstream()
@@ -312,6 +340,14 @@ class LifecycleTests(unittest.TestCase):
         rc, data = self.cli(["upstream", "status", "foo"])
         self.assertEqual(rc, 2)
         self.assertNotIn("TOP_SECRET", json.dumps(data))
+
+    def test_git_timeout_does_not_echo_credential_bearing_command(self):
+        secret_url = "https://user:TOP_SECRET@example.com/skills.git"
+        with mock.patch.object(life.source.subprocess, "run", side_effect=subprocess.TimeoutExpired(["git", "clone", secret_url], 120)):
+            with self.assertRaises(life.source.SourceError) as caught:
+                life.source._run_git(["clone", secret_url], sensitive_values=(secret_url,))
+        self.assertNotIn("TOP_SECRET", str(caught.exception))
+        self.assertIn("120", str(caught.exception))
 
     def test_untrusted_source_path_is_rejected(self):
         for path in ("../foo", "/absolute", "..\\foo", "C:/foo"):
@@ -371,6 +407,38 @@ class LifecycleTests(unittest.TestCase):
             self.migrate()
         self.assertEqual(target.read_text(), "outside")
 
+    def test_migration_publication_does_not_overwrite_concurrent_metadata(self):
+        (self.canonical / ".skill-source.json").unlink()
+        target = self.canonical / ".skill-source.json"
+        original_link = os.link
+
+        def concurrent_write(src, dst):
+            target.write_text("another writer's metadata")
+            return original_link(src, dst)
+
+        with mock.patch.object(life.os, "link", side_effect=concurrent_write):
+            with self.assertRaises(FileExistsError):
+                self.migrate()
+        self.assertEqual(target.read_text(), "another writer's metadata")
+        self.assertFalse(list(self.canonical.parent.glob(".skill-librarian-provenance-*")))
+
+    def test_migration_failure_after_publication_cleans_only_own_metadata(self):
+        (self.canonical / ".skill-source.json").unlink()
+        original_assert = life._assert_unchanged
+        calls = [0]
+
+        def fail_second(*args):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise life.LifecycleError("injected validation failure")
+            return original_assert(*args)
+
+        with mock.patch.object(life, "_assert_unchanged", side_effect=fail_second):
+            with self.assertRaises(life.LifecycleError):
+                self.migrate()
+        self.assertFalse((self.canonical / ".skill-source.json").exists())
+        self.assertEqual((self.canonical / "references" / "rules.md").read_text(), "baseline\n")
+
     def test_manifest_migrates_individual_skills_and_reports_failures(self):
         for name in ("foo", "bar"):
             (self.library / "coding" / name / ".skill-source.json").unlink()
@@ -400,6 +468,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(result["summary"], {"UPDATED": 1, "BLOCKED": 2})
         self.assertEqual(self.inspect()["status"], "SAME")
+
+    def test_canonical_update_does_not_update_project_copy(self):
+        project_copy = self.root / "project" / ".agents" / "skills" / "foo"
+        project_copy.parent.mkdir(parents=True)
+        shutil.copytree(self.canonical, project_copy)
+        self.change_upstream()
+        self.update()
+        self.assertEqual((project_copy / "references" / "rules.md").read_text(), "baseline\n")
 
     def test_legacy_status_engine_still_reads_migrated_provenance(self):
         (self.canonical / ".skill-source.json").unlink()
